@@ -1,0 +1,1020 @@
+const History = require("../../models/history.model");
+const User = require("../../models/user.model");
+const Host = require("../../models/host.model");
+
+//mongoose
+const mongoose = require("mongoose");
+
+//get coin history ( user )
+exports.getCoinTransactionHistory = async (req, res) => {
+  try {
+    if (!req.query.userId) {
+      return res.status(200).json({ status: false, message: "Invalid details." });
+    }
+
+    if (req.query.userId && !mongoose.Types.ObjectId.isValid(req.query.userId)) {
+      return res.status(200).json({ status: false, message: "Invalid userId. Please provide a valid ObjectId." });
+    }
+
+    const userId = new mongoose.Types.ObjectId(req.query.userId);
+    const start = req.query.start ? parseInt(req.query.start) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const startDate = req.query.startDate || "All";
+    const endDate = req.query.endDate || "All";
+    const search = req.query.search?.trim();
+
+    let dateFilterQuery = {};
+    if (startDate !== "All" && endDate !== "All") {
+      const startDateObj = new Date(startDate);
+      const endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+
+      dateFilterQuery = {
+        createdAt: {
+          $gte: startDateObj,
+          $lte: endDateObj,
+        },
+      };
+    }
+
+    const [user, result] = await Promise.all([
+      User.findOne({ _id: userId }).select("_id").lean(),
+      History.aggregate([
+        { $match: { ...dateFilterQuery, type: { $nin: [5] }, userId: userId, userCoin: { $ne: 0 } } },
+        {
+          $lookup: {
+            from: "hosts",
+            localField: "hostId",
+            foreignField: "_id",
+            pipeline: [
+              {
+                $project: {
+                  _id: 1,
+                  name: 1,
+                  image: 1,
+                  uniqueId: 1,
+                },
+              },
+            ],
+            as: "receiver",
+          },
+        },
+        { $unwind: { path: "$receiver", preserveNullAndEmptyArrays: true } },
+
+        ...(search
+          ? [
+              {
+                $match: {
+                  $or: [{ uniqueId: { $regex: search, $options: "i" } }, { "receiver.name": { $regex: search, $options: "i" } }, { "receiver.uniqueId": { $regex: search, $options: "i" } }],
+                },
+              },
+            ]
+          : []),
+
+        {
+          $addFields: {
+            isIncome: {
+              $cond: {
+                if: { $in: ["$type", [1, 6, 7, 8, 14]] },
+                then: true,
+                else: {
+                  $cond: {
+                    if: {
+                      $in: ["$type", [2, 3, 10, 11, 12, 13, 15]],
+                    },
+                    then: false,
+                    else: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+
+        {
+          $facet: {
+            totalCount: [{ $count: "count" }],
+            paginatedHistory: [
+              { $sort: { createdAt: -1 } },
+              { $skip: (start - 1) * limit },
+              { $limit: limit },
+              {
+                $addFields: {
+                  typeDescription: {
+                    $switch: {
+                      branches: [
+                        { case: { $eq: ["$type", 1] }, then: "Login Bonus" },
+                        { case: { $eq: ["$type", 2] }, then: "Live Gift" },
+                        { case: { $eq: ["$type", 3] }, then: "Video Call Gift" },
+                        { case: { $eq: ["$type", 6] }, then: "Daily Check-in Reward" },
+                        { case: { $eq: ["$type", 7] }, then: "Purchased Coin Plan" },
+                        { case: { $eq: ["$type", 8] }, then: "VIP Plan Purchase" },
+                        { case: { $eq: ["$type", 9] }, then: "Chat with Host" },
+                        { case: { $eq: ["$type", 10] }, then: "Chat Gift" },
+                        { case: { $eq: ["$type", 11] }, then: "Private Audio Call" },
+                        { case: { $eq: ["$type", 12] }, then: "Private Video Call" },
+                        { case: { $eq: ["$type", 13] }, then: "Random Video Call" },
+                        { case: { $eq: ["$type", 14] }, then: "Admin Add Coin" },
+                        { case: { $eq: ["$type", 15] }, then: "Admin Deduct Coin" },
+                      ],
+                      default: "Unknown Type",
+                    },
+                  },
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  uniqueId: 1,
+                  type: 1,
+                  typeDescription: 1,
+                  userCoin: 1,
+                  adminCoin: 1,
+                  hostCoin: 1,
+                  agencyCoin: 1,
+                  payoutStatus: 1,
+                  createdAt: 1,
+                  receiverName: { $ifNull: ["$receiver.name", ""] },
+                  receiverImage: { $ifNull: ["$receiver.image", ""] },
+                  receiverUniqueId: { $ifNull: ["$receiver.uniqueId", ""] },
+                  isIncome: 1,
+                },
+              },
+            ],
+            incomeStats: [
+              {
+                $group: {
+                  _id: null,
+                  totalIncome: { $sum: { $cond: [{ $eq: ["$isIncome", true] }, "$userCoin", 0] } },
+                  totalOutgoing: { $sum: { $cond: [{ $eq: ["$isIncome", false] }, "$userCoin", 0] } },
+                },
+              },
+            ],
+          },
+        },
+      ]),
+    ]);
+
+    if (!user) {
+      return res.status(200).json({ status: false, message: "User does not found." });
+    }
+
+    const total = result[0].totalCount[0]?.count || 0;
+    const transactionHistory = result[0].paginatedHistory;
+    const totalIncome = result[0].incomeStats[0]?.totalIncome || 0;
+    const totalOutgoing = result[0].incomeStats[0]?.totalOutgoing || 0;
+
+    return res.status(200).json({
+      status: true,
+      message: "Transaction history fetch successfully.",
+      totalIncome,
+      totalOutgoing,
+      total: total,
+      data: transactionHistory,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: false, message: "Something went wrong. Please try again later." });
+  }
+};
+
+//get call history ( user )
+exports.fetchCallTransactionHistory = async (req, res) => {
+  try {
+    if (!req.query.userId) {
+      return res.status(200).json({ status: false, message: "❌ Invalid details." });
+    }
+
+    if (req.query.userId && !mongoose.Types.ObjectId.isValid(req.query.userId)) {
+      return res.status(200).json({ status: false, message: "Invalid userId. Please provide a valid ObjectId." });
+    }
+
+    const userId = new mongoose.Types.ObjectId(req.query.userId);
+    const start = req.query.start ? parseInt(req.query.start) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const startDate = req.query.startDate || "All";
+    const endDate = req.query.endDate || "All";
+    const search = req.query.search?.trim();
+
+    let dateFilterQuery = {};
+    if (startDate !== "All" && endDate !== "All") {
+      const startDateObj = new Date(startDate);
+      const endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+
+      dateFilterQuery = {
+        createdAt: {
+          $gte: startDateObj,
+          $lte: endDateObj,
+        },
+      };
+    }
+
+    const [user, result] = await Promise.all([
+      User.findOne({ _id: userId }).select("_id").lean(),
+      History.aggregate([
+        {
+          $match: {
+            ...dateFilterQuery,
+            type: { $in: [11, 12, 13] },
+            userId: userId,
+            userCoin: { $ne: 0 },
+          },
+        },
+        {
+          $lookup: {
+            from: "hosts",
+            localField: "hostId",
+            foreignField: "_id",
+            pipeline: [
+              {
+                $project: {
+                  _id: 1,
+                  name: 1,
+                  image: 1,
+                  uniqueId: 1,
+                },
+              },
+            ],
+            as: "receiver",
+          },
+        },
+        {
+          $unwind: { path: "$receiver", preserveNullAndEmptyArrays: true },
+        },
+        ...(search
+          ? [
+              {
+                $match: {
+                  $or: [{ uniqueId: { $regex: search, $options: "i" } }, { "receiver.name": { $regex: search, $options: "i" } }, { "receiver.uniqueId": { $regex: search, $options: "i" } }],
+                },
+              },
+            ]
+          : []),
+        {
+          $addFields: {
+            durationInSeconds: {
+              $cond: [
+                { $regexMatch: { input: "$duration", regex: /^\d{2}:\d{2}:\d{2}$/ } },
+                {
+                  $add: [
+                    { $multiply: [{ $toInt: { $arrayElemAt: [{ $split: ["$duration", ":"] }, 0] } }, 3600] },
+                    { $multiply: [{ $toInt: { $arrayElemAt: [{ $split: ["$duration", ":"] }, 1] } }, 60] },
+                    { $toInt: { $arrayElemAt: [{ $split: ["$duration", ":"] }, 2] } },
+                  ],
+                },
+                0,
+              ],
+            },
+          },
+        }, //(convert duration → seconds)
+        {
+          $facet: {
+            totalCount: [{ $count: "count" }],
+            paginatedHistory: [
+              { $sort: { createdAt: -1 } },
+              { $skip: (start - 1) * limit },
+              { $limit: limit },
+              {
+                $addFields: {
+                  typeDescription: {
+                    $switch: {
+                      branches: [
+                        { case: { $eq: ["$type", 11] }, then: "Private Audio Call" },
+                        { case: { $eq: ["$type", 12] }, then: "Private Video Call" },
+                        { case: { $eq: ["$type", 13] }, then: "Random Video Call" },
+                      ],
+                      default: "Unknown Type",
+                    },
+                  },
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  uniqueId: 1,
+                  type: 1,
+                  typeDescription: 1,
+                  userCoin: 1,
+                  adminCoin: 1,
+                  hostCoin: 1,
+                  agencyCoin: 1,
+                  callType: 1,
+                  isRandom: 1,
+                  isPrivate: 1,
+                  callStartTime: 1,
+                  callEndTime: 1,
+                  duration: 1,
+                  createdAt: 1,
+                  receiverName: { $ifNull: ["$receiver.name", ""] },
+                  receiverImage: { $ifNull: ["$receiver.image", ""] },
+                  receiverUniqueId: { $ifNull: ["$receiver.uniqueId", ""] },
+                },
+              },
+            ],
+            durationSummary: [
+              {
+                $group: {
+                  _id: null,
+                  totalSeconds: { $sum: "$durationInSeconds" },
+                },
+              },
+            ],
+          },
+        },
+      ]),
+    ]);
+
+    if (!user) {
+      return res.status(200).json({ status: false, message: "👤 User not found." });
+    }
+
+    const total = result[0].totalCount[0]?.count || 0;
+    const transactionHistory = result[0].paginatedHistory;
+
+    const totalSeconds = result[0].durationSummary[0]?.totalSeconds || 0; //Convert total seconds → HH:MM:SS
+
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    const totalDuration = `${String(hours).padStart(2, "0")}:` + `${String(minutes).padStart(2, "0")}:` + `${String(seconds).padStart(2, "0")}`;
+
+    return res.status(200).json({
+      status: true,
+      message: "Transaction history fetched successfully.",
+      total,
+      totalDuration,
+      data: transactionHistory,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: false, message: "Something went wrong. Please try again later." });
+  }
+};
+
+//get gift history ( user )
+exports.retrieveGiftTransactionHistory = async (req, res) => {
+  try {
+    if (!req.query.userId) {
+      return res.status(200).json({ status: false, message: "❌ Invalid details." });
+    }
+
+    if (req.query.userId && !mongoose.Types.ObjectId.isValid(req.query.userId)) {
+      return res.status(200).json({ status: false, message: "Invalid userId. Please provide a valid ObjectId." });
+    }
+
+    const userId = new mongoose.Types.ObjectId(req.query.userId);
+    const start = req.query.start ? parseInt(req.query.start) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const startDate = req.query.startDate || "All";
+    const endDate = req.query.endDate || "All";
+    const search = req.query.search?.trim();
+
+    let dateFilterQuery = {};
+    if (startDate !== "All" && endDate !== "All") {
+      const startDateObj = new Date(startDate);
+      const endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+
+      dateFilterQuery = {
+        createdAt: {
+          $gte: startDateObj,
+          $lte: endDateObj,
+        },
+      };
+    }
+
+    const [user, result] = await Promise.all([
+      User.findOne({ _id: userId }).select("_id").lean(),
+      History.aggregate([
+        {
+          $match: {
+            ...dateFilterQuery,
+            type: { $in: [2, 3, 10] },
+            userId: userId,
+            userCoin: { $ne: 0 },
+          },
+        },
+        {
+          $lookup: {
+            from: "hosts",
+            localField: "hostId",
+            foreignField: "_id",
+            pipeline: [
+              {
+                $project: {
+                  _id: 1,
+                  name: 1,
+                  image: 1,
+                  uniqueId: 1,
+                },
+              },
+            ],
+            as: "receiver",
+          },
+        },
+        { $unwind: { path: "$receiver", preserveNullAndEmptyArrays: true } },
+        ...(search
+          ? [
+              {
+                $match: {
+                  $or: [{ uniqueId: { $regex: search, $options: "i" } }, { "receiver.name": { $regex: search, $options: "i" } }, { "receiver.uniqueId": { $regex: search, $options: "i" } }],
+                },
+              },
+            ]
+          : []),
+        {
+          $facet: {
+            totalCount: [{ $count: "count" }],
+            paginatedHistory: [
+              { $sort: { createdAt: -1 } },
+              { $skip: (start - 1) * limit },
+              { $limit: limit },
+              {
+                $addFields: {
+                  typeDescription: {
+                    $switch: {
+                      branches: [
+                        { case: { $eq: ["$type", 2] }, then: "Live Gift" },
+                        { case: { $eq: ["$type", 3] }, then: "Video Call Gift" },
+                        { case: { $eq: ["$type", 10] }, then: "Chat Gift" },
+                      ],
+                      default: "Unknown Type",
+                    },
+                  },
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  uniqueId: 1,
+                  type: 1,
+                  typeDescription: 1,
+                  userCoin: 1,
+                  adminCoin: 1,
+                  hostCoin: 1,
+                  agencyCoin: 1,
+                  createdAt: 1,
+                  receiverName: { $ifNull: ["$receiver.name", ""] },
+                  receiverImage: { $ifNull: ["$receiver.image", ""] },
+                  receiverUniqueId: { $ifNull: ["$receiver.uniqueId", ""] },
+                },
+              },
+            ],
+          },
+        },
+      ]),
+    ]);
+
+    if (!user) {
+      return res.status(200).json({ status: false, message: "👤 User not found." });
+    }
+
+    const total = result[0].totalCount[0]?.count || 0;
+    const transactionHistory = result[0].paginatedHistory;
+
+    return res.status(200).json({
+      status: true,
+      message: "Transaction history fetched successfully.",
+      total: total,
+      data: transactionHistory,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: false, message: "Something went wrong. Please try again later." });
+  }
+};
+
+//get vipPlan purchase history ( user )
+exports.getVIPPlanTransactionHistory = async (req, res) => {
+  try {
+    if (!req.query.userId) {
+      return res.status(200).json({ status: false, message: "Invalid details." });
+    }
+
+    if (req.query.userId && !mongoose.Types.ObjectId.isValid(req.query.userId)) {
+      return res.status(200).json({ status: false, message: "Invalid userId. Please provide a valid ObjectId." });
+    }
+
+    const userId = new mongoose.Types.ObjectId(req.query.userId);
+    const start = req.query.start ? parseInt(req.query.start) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const startDate = req.query.startDate || "All";
+    const endDate = req.query.endDate || "All";
+
+    let dateFilterQuery = {};
+    if (startDate !== "All" && endDate !== "All") {
+      const startDateObj = new Date(startDate);
+      const endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+
+      dateFilterQuery = {
+        createdAt: {
+          $gte: startDateObj,
+          $lte: endDateObj,
+        },
+      };
+    }
+
+    const [user, result] = await Promise.all([
+      User.findOne({ _id: userId }).select("_id").lean(),
+      History.aggregate([
+        {
+          $match: {
+            ...dateFilterQuery,
+            type: 8,
+            userId: userId,
+            userCoin: { $ne: 0 },
+          },
+        },
+        {
+          $facet: {
+            totalCount: [{ $count: "count" }],
+            paginatedHistory: [
+              { $sort: { createdAt: -1 } },
+              { $skip: (start - 1) * limit },
+              { $limit: limit },
+              {
+                $project: {
+                  _id: 1,
+                  uniqueId: 1,
+                  type: 1,
+                  userCoin: 1,
+                  bonusCoins: 1,
+                  validity: 1,
+                  validityType: 1,
+                  price: 1,
+                  paymentGateway: 1,
+                  createdAt: 1,
+                },
+              },
+            ],
+          },
+        },
+      ]),
+    ]);
+
+    if (!user) {
+      return res.status(200).json({ status: false, message: "User does not found." });
+    }
+
+    const total = result[0].totalCount[0]?.count || 0;
+    const transactionHistory = result[0].paginatedHistory;
+
+    return res.status(200).json({
+      status: true,
+      message: "Transaction history fetch successfully.",
+      total: total,
+      data: transactionHistory,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: false, message: "Something went wrong. Please try again later." });
+  }
+};
+
+//get coin history ( host )
+exports.fetchCoinTransactionHistory = async (req, res) => {
+  try {
+    if (!req.query.hostId) {
+      return res.status(200).json({ status: false, message: "Invalid details." });
+    }
+
+    const hostId = new mongoose.Types.ObjectId(req.query.hostId);
+
+    if (req.query.hostId && !mongoose.Types.ObjectId.isValid(req.query.hostId)) {
+      return res.status(200).json({ status: false, message: "Invalid hostId. Please provide a valid ObjectId." });
+    }
+
+    const start = req.query.start ? parseInt(req.query.start) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const startDate = req.query.startDate || "All";
+    const endDate = req.query.endDate || "All";
+    const search = req.query.search?.trim();
+
+    let dateFilterQuery = {};
+    if (startDate !== "All" && endDate !== "All") {
+      const startDateObj = new Date(startDate);
+      const endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+
+      dateFilterQuery = {
+        createdAt: {
+          $gte: startDateObj,
+          $lte: endDateObj,
+        },
+      };
+    }
+
+    const [host, historyResult] = await Promise.all([
+      Host.findOne({ _id: hostId }).select("_id").lean(),
+      History.aggregate([
+        {
+          $match: {
+            ...dateFilterQuery,
+            type: { $in: [2, 3, 5, 9, 10, 11, 12, 13, 14, 15] },
+            hostId: hostId,
+            hostCoin: { $ne: 0 },
+          },
+        },
+        {
+          $lookup: {
+            from: "users",
+            localField: "userId",
+            foreignField: "_id",
+            as: "sender",
+            pipeline: [{ $project: { name: 1, image: 1, uniqueId: 1 } }],
+          },
+        },
+        { $unwind: { path: "$sender", preserveNullAndEmptyArrays: true } },
+        ...(search
+          ? [
+              {
+                $match: {
+                  $or: [{ uniqueId: { $regex: search, $options: "i" } }, { "sender.name": { $regex: search, $options: "i" } }, { "sender.uniqueId": { $regex: search, $options: "i" } }],
+                },
+              },
+            ]
+          : []),
+        {
+          $facet: {
+            totalCount: [{ $count: "count" }],
+            paginatedHistory: [
+              { $sort: { createdAt: -1 } },
+              { $skip: (start - 1) * limit },
+              { $limit: limit },
+              {
+                $addFields: {
+                  typeDescription: {
+                    $switch: {
+                      branches: [
+                        { case: { $eq: ["$type", 2] }, then: "Live Gift" },
+                        { case: { $eq: ["$type", 3] }, then: "Video Call Gift" },
+                        { case: { $eq: ["$type", 5] }, then: "Withdrawal by Host" },
+                        { case: { $eq: ["$type", 9] }, then: "Chat with Host" },
+                        { case: { $eq: ["$type", 10] }, then: "Chat Gift" },
+                        { case: { $eq: ["$type", 11] }, then: "Private Audio Call" },
+                        { case: { $eq: ["$type", 12] }, then: "Private Video Call" },
+                        { case: { $eq: ["$type", 13] }, then: "Random Video Call" },
+                        { case: { $eq: ["$type", 14] }, then: "Admin Add Coin" },
+                        { case: { $eq: ["$type", 15] }, then: "Admin Deduct Coin" },
+                      ],
+                      default: "Unknown Type",
+                    },
+                  },
+                  senderName: { $ifNull: ["$sender.name", ""] },
+                  senderImage: { $ifNull: ["$sender.image", ""] },
+                  senderUniqueId: { $ifNull: ["$sender.uniqueId", ""] },
+                  isIncome: {
+                    $cond: {
+                      if: { $in: ["$type", [2, 3, 9, 10, 11, 12, 13, 14]] },
+                      then: true,
+                      else: {
+                        $cond: {
+                          if: { $and: [{ $eq: ["$type", 5] }, { $eq: ["$payoutStatus", 2] }] },
+                          then: false,
+                          else: false,
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  uniqueId: 1,
+                  type: 1,
+                  typeDescription: 1,
+                  userCoin: 1,
+                  adminCoin: 1,
+                  hostCoin: 1,
+                  agencyCoin: 1,
+                  payoutStatus: 1,
+                  createdAt: 1,
+                  senderName: 1,
+                  senderImage: 1,
+                  senderUniqueId: 1,
+                  isIncome: 1,
+                },
+              },
+            ],
+          },
+        },
+      ]),
+    ]);
+
+    if (!host) {
+      return res.status(200).json({ status: false, message: "Host does not found." });
+    }
+
+    const total = historyResult[0].totalCount[0]?.count || 0;
+    const transactionHistory = historyResult[0].paginatedHistory;
+
+    return res.status(200).json({
+      status: true,
+      message: "Transaction history fetch successfully.",
+      total: total,
+      data: transactionHistory,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: false, message: "Something went wrong. Please try again later." });
+  }
+};
+
+//get call history ( host )
+exports.listCallTransactions = async (req, res) => {
+  try {
+    if (!req.query.hostId) {
+      return res.status(200).json({ status: false, message: "Invalid details." });
+    }
+
+    if (req.query.hostId && !mongoose.Types.ObjectId.isValid(req.query.hostId)) {
+      return res.status(200).json({ status: false, message: "Invalid hostId. Please provide a valid ObjectId." });
+    }
+
+    const hostId = new mongoose.Types.ObjectId(req.query.hostId);
+
+    const start = req.query.start ? parseInt(req.query.start) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const startDate = req.query.startDate || "All";
+    const endDate = req.query.endDate || "All";
+    const search = req.query.search?.trim();
+
+    let dateFilterQuery = {};
+    if (startDate !== "All" && endDate !== "All") {
+      const startDateObj = new Date(startDate);
+      const endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+
+      dateFilterQuery = {
+        createdAt: {
+          $gte: startDateObj,
+          $lte: endDateObj,
+        },
+      };
+    }
+
+    const [host, historyResult] = await Promise.all([
+      Host.findOne({ _id: hostId }).select("_id").lean(),
+      History.aggregate([
+        {
+          $match: {
+            ...dateFilterQuery,
+            type: { $in: [11, 12, 13] },
+            hostId: hostId,
+            hostCoin: { $ne: 0 },
+          },
+        },
+        {
+          $lookup: {
+            from: "users",
+            localField: "userId",
+            foreignField: "_id",
+            pipeline: [{ $project: { name: 1, image: 1, uniqueId: 1 } }],
+            as: "sender",
+          },
+        },
+        { $unwind: { path: "$sender", preserveNullAndEmptyArrays: true } },
+        ...(search
+          ? [
+              {
+                $match: {
+                  $or: [{ "sender.name": { $regex: search, $options: "i" } }, { "sender.uniqueId": { $regex: search, $options: "i" } }, { uniqueId: { $regex: search, $options: "i" } }],
+                },
+              },
+            ]
+          : []),
+        {
+          $addFields: {
+            durationInSeconds: {
+              $cond: [
+                { $regexMatch: { input: "$duration", regex: /^\d{2}:\d{2}:\d{2}$/ } },
+                {
+                  $add: [
+                    { $multiply: [{ $toInt: { $arrayElemAt: [{ $split: ["$duration", ":"] }, 0] } }, 3600] },
+                    { $multiply: [{ $toInt: { $arrayElemAt: [{ $split: ["$duration", ":"] }, 1] } }, 60] },
+                    { $toInt: { $arrayElemAt: [{ $split: ["$duration", ":"] }, 2] } },
+                  ],
+                },
+                0,
+              ],
+            },
+          },
+        },
+        {
+          $facet: {
+            totalCount: [{ $count: "count" }],
+            data: [
+              { $sort: { createdAt: -1 } },
+              { $skip: (start - 1) * limit },
+              { $limit: limit },
+              {
+                $addFields: {
+                  typeDescription: {
+                    $switch: {
+                      branches: [
+                        { case: { $eq: ["$type", 11] }, then: "Private Audio Call" },
+                        { case: { $eq: ["$type", 12] }, then: "Private Video Call" },
+                        { case: { $eq: ["$type", 13] }, then: "Random Video Call" },
+                      ],
+                      default: "Unknown Type",
+                    },
+                  },
+                  senderName: { $ifNull: ["$sender.name", ""] },
+                  senderImage: { $ifNull: ["$sender.image", ""] },
+                  senderUniqueId: { $ifNull: ["$sender.uniqueId", ""] },
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  uniqueId: 1,
+                  type: 1,
+                  typeDescription: 1,
+                  userCoin: 1,
+                  adminCoin: 1,
+                  hostCoin: 1,
+                  agencyCoin: 1,
+                  callType: 1,
+                  isRandom: 1,
+                  isPrivate: 1,
+                  callStartTime: 1,
+                  callEndTime: 1,
+                  duration: 1,
+                  createdAt: 1,
+                  senderName: 1,
+                  senderImage: 1,
+                  senderUniqueId: 1,
+                },
+              },
+            ],
+            durationSummary: [
+              {
+                $group: {
+                  _id: null,
+                  totalSeconds: { $sum: "$durationInSeconds" },
+                },
+              },
+            ],
+          },
+        },
+      ]),
+    ]);
+
+    if (!host) {
+      return res.status(200).json({ status: false, message: "Host does not found." });
+    }
+
+    const total = historyResult[0].totalCount[0]?.count || 0;
+    const data = historyResult[0].data || [];
+    const totalSeconds = historyResult[0].durationSummary[0]?.totalSeconds || 0;
+
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    const totalDuration = `${String(hours).padStart(2, "0")}:` + `${String(minutes).padStart(2, "0")}:` + `${String(seconds).padStart(2, "0")}`;
+
+    return res.status(200).json({
+      status: true,
+      message: "Transaction history fetched successfully.",
+      total: total,
+      totalDuration,
+      data,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: false, message: "Something went wrong. Please try again later." });
+  }
+};
+
+//get gift history ( host )
+exports.fetchGiftTransactionHistory = async (req, res) => {
+  try {
+    if (!req.query.hostId) {
+      return res.status(200).json({ status: false, message: "Invalid details." });
+    }
+
+    if (req.query.hostId && !mongoose.Types.ObjectId.isValid(req.query.hostId)) {
+      return res.status(200).json({ status: false, message: "Invalid hostId. Please provide a valid ObjectId." });
+    }
+
+    const hostId = new mongoose.Types.ObjectId(req.query.hostId);
+
+    const start = req.query.start ? parseInt(req.query.start) : 1;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const startDate = req.query.startDate || "All";
+    const endDate = req.query.endDate || "All";
+    const search = req.query.search?.trim();
+
+    let dateFilterQuery = {};
+    if (startDate !== "All" && endDate !== "All") {
+      const startDateObj = new Date(startDate);
+      const endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+
+      dateFilterQuery = {
+        createdAt: {
+          $gte: startDateObj,
+          $lte: endDateObj,
+        },
+      };
+    }
+
+    const [host, historyResult] = await Promise.all([
+      Host.findOne({ _id: hostId }).select("_id").lean(),
+      History.aggregate([
+        {
+          $match: {
+            ...dateFilterQuery,
+            type: { $in: [2, 3, 10] },
+            hostId: hostId,
+            hostCoin: { $ne: 0 },
+          },
+        },
+        {
+          $lookup: {
+            from: "users",
+            localField: "userId",
+            foreignField: "_id",
+            pipeline: [{ $project: { name: 1, image: 1, uniqueId: 1 } }],
+            as: "sender",
+          },
+        },
+        { $unwind: { path: "$sender", preserveNullAndEmptyArrays: true } },
+        ...(search
+          ? [
+              {
+                $match: {
+                  $or: [{ "sender.name": { $regex: search, $options: "i" } }, { "sender.uniqueId": { $regex: search, $options: "i" } }, { uniqueId: { $regex: search, $options: "i" } }],
+                },
+              },
+            ]
+          : []),
+        {
+          $facet: {
+            totalCount: [{ $count: "count" }],
+            paginatedHistory: [
+              { $sort: { createdAt: -1 } },
+              { $skip: (start - 1) * limit },
+              { $limit: limit },
+              {
+                $addFields: {
+                  typeDescription: {
+                    $switch: {
+                      branches: [
+                        { case: { $eq: ["$type", 2] }, then: "Live Gift" },
+                        { case: { $eq: ["$type", 3] }, then: "Video Call Gift" },
+                        { case: { $eq: ["$type", 10] }, then: "Chat Gift" },
+                      ],
+                      default: "Unknown Type",
+                    },
+                  },
+                  senderName: { $ifNull: ["$sender.name", ""] },
+                  senderImage: { $ifNull: ["$sender.image", ""] },
+                  senderUniqueId: { $ifNull: ["$sender.uniqueId", ""] },
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  uniqueId: 1,
+                  type: 1,
+                  typeDescription: 1,
+                  userCoin: 1,
+                  adminCoin: 1,
+                  hostCoin: 1,
+                  agencyCoin: 1,
+                  createdAt: 1,
+                  senderName: 1,
+                  senderImage: 1,
+                  senderUniqueId: 1,
+                },
+              },
+            ],
+          },
+        },
+      ]),
+    ]);
+
+    if (!host) {
+      return res.status(200).json({ status: false, message: "Host does not found." });
+    }
+
+    const total = historyResult[0].totalCount[0]?.count || 0;
+    const transactionHistory = historyResult[0].paginatedHistory;
+
+    return res.status(200).json({
+      status: true,
+      message: "Transaction history fetched successfully.",
+      total: total,
+      data: transactionHistory,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: false, message: "Something went wrong. Please try again later." });
+  }
+};
