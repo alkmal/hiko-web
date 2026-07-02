@@ -229,6 +229,85 @@ async function startServer() {
     return res.status(200).json({ status: true, message: "User is not live", liveUser: null, isLive: false });
   });
 
+  const buildLiveUser = async (userId, overrides = {}) => {
+    const query = userId && mongoose.Types.ObjectId.isValid(userId)
+      ? { _id: new mongoose.Types.ObjectId(userId) }
+      : { uniqueId: "100001" };
+    const rawUser = await mongoose.connection.db.collection("users").findOne(query)
+      || await mongoose.connection.db.collection("users").findOne({});
+    const user = cleanUser(rawUser) || {};
+    const now = new Date().toISOString();
+    const liveId = new mongoose.Types.ObjectId().toString();
+    const seat = Array.from({ length: 15 }, (_, index) => ({
+      position: index + 1,
+      name: index === 0 ? (user.name || "HIKO Host") : "",
+      image: index === 0 ? (user.image || "") : "",
+      country: index === 0 ? (user.country || "Palestine") : "",
+      reserved: index === 0,
+      mute: false,
+      lock: false,
+      agoraUid: index === 0 ? Number(overrides.agoraUID || 1) : 0,
+      userId: index === 0 ? (user.id || "") : "",
+      coin: 0,
+      isHost: index === 0,
+    }));
+
+    return {
+      _id: liveId,
+      id: liveId,
+      liveUserId: user.id || liveId,
+      liveStreamingId: liveId,
+      channel: overrides.channel || user.id || liveId,
+      agoraUID: Number(overrides.agoraUID || 1),
+      token: "",
+      country: user.country || "Palestine",
+      image: user.image || "",
+      rCoin: user.rCoin || 0,
+      diamond: user.diamond || 0,
+      name: user.name || "HIKO Host",
+      username: user.username || "hiko_host",
+      uniqueId: user.uniqueId || "100001",
+      isVIP: true,
+      isPublic: overrides.isPublic !== false,
+      audio: true,
+      age: user.age || 22,
+      view: 0,
+      roomImage: overrides.roomImage || user.image || "",
+      roomName: overrides.roomName || "HIKO Live Room",
+      roomWelcome: overrides.roomWelcome || "Welcome to HIKO",
+      privateCode: Number(overrides.privateCode || 0),
+      roomOwnerUniqueId: user.uniqueId || "100001",
+      seat,
+      background: overrides.background || "",
+      filter: "",
+      isPkMode: false,
+      pkView: false,
+      disconnect: false,
+      duration: 0,
+      createdAt: now,
+      updatedAt: now,
+      audioConfig: { hostMute: false },
+    };
+  };
+
+  app.patch("/liveUser/live", async (req, res) => {
+    try {
+      const userId = req.query.userId || req.body?.userId;
+      const liveUser = await buildLiveUser(userId, {
+        roomName: req.body?.roomName,
+        roomWelcome: req.body?.roomWelcome,
+        channel: req.body?.channel,
+        background: req.body?.background,
+        privateCode: req.body?.privateCode,
+        agoraUID: req.body?.agoraUID,
+        isPublic: String(req.body?.isPublic || "true") !== "false",
+      });
+      return res.status(200).json({ status: true, message: "Live stream started", liveUser });
+    } catch (error) {
+      return res.status(200).json({ status: false, message: error.message || "Failed to start live stream", liveUser: null });
+    }
+  });
+
   app.get("/block/getUsersWhoBlockedMe", async (req, res) => {
     return res.status(200).json({ status: true, message: "Blocked users fetched", users: [], data: [], total: 0 });
   });
