@@ -286,7 +286,7 @@ async function startServer() {
       duration: 0,
       createdAt: now,
       updatedAt: now,
-      audioConfig: { hostMute: false },
+      audioConfig: { isHostMute: 0 },
     };
   };
 
