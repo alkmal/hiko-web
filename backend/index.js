@@ -137,8 +137,9 @@ async function startServer() {
     level: u.level || { _id: "demo-level", name: "Level 1", coin: 0, image: "", accessibleFunction: { uploadPost: true, uploadVideo: true, liveStreaming: true, freeCall: true, cashOut: true } },
     notification: u.notification || { likeCommentShare: true, newFollow: true, favoriteLive: true, message: true },
     isBlock: !!u.isBlock,
-    isHost: !!u.isHost,
-    isVIP: !!u.isVIP,
+    isHost: true,
+    isVIP: true,
+    enableToLive: true,
     isAgency: !!u.isAgency,
     isCoinSeller: !!u.isCoinSeller
   } : null;
@@ -239,16 +240,20 @@ async function startServer() {
     const now = new Date().toISOString();
     const liveId = new mongoose.Types.ObjectId().toString();
     const seat = Array.from({ length: 15 }, (_, index) => ({
+      _id: new mongoose.Types.ObjectId().toString(),
       position: index + 1,
       name: index === 0 ? (user.name || "HIKO Host") : "",
       image: index === 0 ? (user.image || "") : "",
+      avatarFrameImage: index === 0 ? (user.avatarFrameImage || "") : "",
       country: index === 0 ? (user.country || "Palestine") : "",
       reserved: index === 0,
-      mute: false,
+      mute: 0,
       lock: false,
       agoraUid: index === 0 ? Number(overrides.agoraUID || 1) : 0,
       userId: index === 0 ? (user.id || "") : "",
       coin: 0,
+      invite: false,
+      isSpeaking: false,
       isHost: index === 0,
     }));
 
