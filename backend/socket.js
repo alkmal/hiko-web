@@ -64,6 +64,504 @@ io.on("connection", async (socket) => {
     console.warn("Invalid globalRoom format:", globalRoom);
   }
 
+  const parseSocketPayload = (payload) => {
+    if (!payload) return {};
+    if (typeof payload === "string") {
+      try {
+        return JSON.parse(payload);
+      } catch (error) {
+        console.error("Invalid socket JSON payload:", payload, error);
+        return {};
+      }
+    }
+    return payload;
+  };
+
+  const toObjectId = (value) => (value && mongoose.Types.ObjectId.isValid(String(value)) ? new mongoose.Types.ObjectId(String(value)) : null);
+  const liveRoomIdFrom = (payload = {}) => String(payload.liveHistoryId || payload.liveStreamingId || payload.liveRoom || payload.liveUserMongoId || "");
+
+  const liveRoomQueryFrom = (roomId) => {
+    const objectId = toObjectId(roomId);
+    return objectId
+      ? { $or: [{ liveHistoryId: objectId }, { _id: objectId }, { liveStreamingId: String(roomId) }] }
+      : { liveStreamingId: String(roomId) };
+  };
+
+  const resolveLiveRoom = async (payloadOrRoomId = {}) => {
+    const incomingRoomId = typeof payloadOrRoomId === "object"
+      ? liveRoomIdFrom(payloadOrRoomId)
+      : String(payloadOrRoomId || "");
+    if (!incomingRoomId) return { incomingRoomId: "", roomId: "", liveHistoryId: null, live: null };
+
+    const live = await mongoose.connection.db.collection("livebroadcasters").findOne(liveRoomQueryFrom(incomingRoomId));
+    const liveHistoryId = live?.liveHistoryId || toObjectId(incomingRoomId);
+    const roomId = liveHistoryId ? String(liveHistoryId) : incomingRoomId;
+    return { incomingRoomId, roomId, liveHistoryId, live };
+  };
+
+  const normalizedPayload = (payload = {}, roomId = "") => ({
+    ...payload,
+    ...(roomId ? { liveHistoryId: roomId, liveStreamingId: roomId } : {}),
+  });
+
+  const joinLiveRoom = (roomId) => {
+    if (roomId && !socket.rooms.has(roomId)) {
+      socket.join(roomId);
+      console.log(`[audioRoom] socket ${socket.id} joined ${roomId}`);
+    }
+  };
+
+  const emitRoomSystemComment = (roomId, payload = {}, action = "enter") => {
+    if (!roomId || !payload.userId) return;
+    const name = payload.name || payload.userName || "User";
+    const text = action === "exit" ? `${name} خرج من الغرفة` : `${name} دخل الغرفة`;
+    io.in(roomId).emit("comment", JSON.stringify({
+      comment: text,
+      liveStreamingId: roomId,
+      liveHistoryId: roomId,
+      isJoined: true,
+      type: "comment",
+      reaction: "",
+      giftCount: "",
+      user: {
+        _id: String(payload.userId || ""),
+        id: String(payload.userId || ""),
+        name,
+        image: payload.image || "",
+        avatarFrameImage: payload.avatarFrameImage || payload.avatarFrame || "",
+        country: payload.country || "",
+        gender: payload.gender || "",
+        isVIP: !!payload.isVIP,
+      },
+    }));
+  };
+
+  const emitLiveViewList = async (roomId, entryPayload = null) => {
+    const { liveHistoryId, roomId: roomKey, live } = await resolveLiveRoom(roomId);
+    if (!liveHistoryId) return;
+    const views = await LiveBroadcastView.find({ liveHistoryId }).lean();
+    const hostUserId = String(live?.userId || live?.liveUserId || live?.hostId || "");
+    const hostView = hostUserId
+      ? {
+          _id: `host-${hostUserId}`,
+          userId: hostUserId,
+          liveHistoryId: roomKey,
+          liveStreamingId: roomKey,
+          name: live?.name || live?.roomName || "Host",
+          userName: live?.name || live?.roomName || "Host",
+          image: live?.image || live?.roomImage || "",
+          gender: live?.gender || "",
+          country: live?.country || "",
+          countryFlagImage: live?.countryFlagImage || "",
+          avatarFrame: live?.avatarFrame || live?.avatarFrameImage || "",
+          avatarFrameImage: live?.avatarFrame || live?.avatarFrameImage || "",
+          entrySvga: "",
+          isVIP: !!(live?.isVIP || live?.isVip),
+          isAdd: true,
+          isHost: true,
+          isUserBackgroundLive: false,
+        }
+      : null;
+    const viewPayload = views.map((view) => ({
+      _id: String(view._id),
+      userId: String(view.userId || ""),
+      liveHistoryId: String(view.liveHistoryId || roomKey),
+      liveStreamingId: roomKey,
+      name: view.name || "",
+      userName: view.name || "",
+      image: view.image || "",
+      gender: view.gender || "",
+      country: view.country || "",
+      countryFlagImage: view.countryFlagImage || "",
+      avatarFrame: view.avatarFrame || view.avatarFrameImage || "",
+      avatarFrameImage: view.avatarFrame || view.avatarFrameImage || "",
+      entrySvga: view.entrySvga || "",
+      isVIP: !!view.isVIP,
+      isAdd: true,
+      isUserBackgroundLive: !!view.isUserBackgroundLive,
+    }));
+    const hasHost = hostUserId && viewPayload.some((view) => String(view.userId) === hostUserId);
+    const finalPayload = hostView && !hasHost ? [hostView, ...viewPayload] : viewPayload;
+    io.in(roomKey).emit("view", JSON.stringify(finalPayload), entryPayload ? JSON.stringify({ ...entryPayload, liveHistoryId: roomKey, liveStreamingId: roomKey }) : null);
+  };
+
+  const seatPayloadFromLive = (live = {}) => {
+    const liveId = String(live._id || live.id || "");
+    const liveHistoryId = String(live.liveHistoryId || live.liveStreamingId || liveId);
+    return {
+      ...live,
+      _id: liveId,
+      id: liveId,
+      liveStreamingId: liveHistoryId,
+      liveUserId: String(live.userId || live.liveUserId || live.hostId || ""),
+      agoraUID: Number(live.agoraUID ?? live.agoraUid ?? 1),
+      audioConfig: live.audioConfig || live.audioRoomConfig || { isHostMute: 0 },
+      audioRoomConfig: live.audioRoomConfig || live.audioConfig || { isHostMute: 0 },
+      isHostExists: true,
+      seat: Array.isArray(live.seat)
+        ? live.seat.map((seat, index) => ({
+            ...seat,
+            _id: String(seat._id || `${liveId}-${index}`),
+            position: Number(seat.position || index + 1),
+            name: seat.name || "",
+            image: seat.image || "",
+            avatarFrameImage: seat.avatarFrameImage || seat.avatarFrame || "",
+            reserved: !!seat.reserved,
+            lock: !!seat.lock,
+            mute: Number(seat.mute || 0),
+            agoraUid: Number(seat.agoraUid || 0),
+            userId: seat.userId ? String(seat.userId) : "",
+          }))
+        : [],
+    };
+  };
+
+  const emitSeatState = async (roomId) => {
+    const live = await mongoose.connection.db.collection("livebroadcasters").findOne(liveRoomQueryFrom(roomId));
+    if (live) {
+      io.in(String(live.liveHistoryId || roomId)).emit("seat", JSON.stringify(seatPayloadFromLive(live)));
+    }
+  };
+
+  const updateLiveRoomSeat = async (roomId, updater) => {
+    const live = await mongoose.connection.db.collection("livebroadcasters").findOne(liveRoomQueryFrom(roomId));
+    if (!live) return null;
+    const seats = Array.isArray(live.seat) ? live.seat : [];
+    updater(seats);
+    await mongoose.connection.db.collection("livebroadcasters").updateOne({ _id: live._id }, { $set: { seat: seats, updatedAt: new Date() } });
+    return { ...live, seat: seats, updatedAt: new Date() };
+  };
+
+  const seatIndexFromPayload = (seats, payload) => {
+    const raw = Number(payload.position);
+    if (Number.isInteger(raw) && raw >= 0 && raw < seats.length) return raw;
+    const byPosition = seats.findIndex((seat) => Number(seat.position) === raw);
+    return byPosition >= 0 ? byPosition : -1;
+  };
+
+  const relayRoomEvent = (incomingEvent, outgoingEvent = incomingEvent) => {
+    socket.on(incomingEvent, async (data) => {
+      try {
+        const payload = parseSocketPayload(data);
+        const { roomId } = await resolveLiveRoom(payload);
+        if (!roomId) return;
+        joinLiveRoom(roomId);
+        io.in(roomId).emit(outgoingEvent, JSON.stringify(normalizedPayload(payload, roomId)));
+      } catch (error) {
+        console.error(`[${incomingEvent}] Error:`, error);
+      }
+    });
+  };
+
+  socket.on("liveBlocklistUpdated", async (data) => {
+    const payload = parseSocketPayload(data);
+    const { roomId } = await resolveLiveRoom(payload);
+    if (roomId) joinLiveRoom(roomId);
+    socket.emit("blockedListUpdated", []);
+  });
+
+  socket.on("commentAudio", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId, liveHistoryId } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      joinLiveRoom(roomId);
+      io.in(roomId).emit("comment", JSON.stringify(normalizedPayload(payload, roomId)));
+      if (liveHistoryId) {
+        await LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $inc: { liveComments: 1 } });
+      }
+    } catch (error) {
+      console.error("[commentAudio] Error:", error);
+    }
+  });
+
+  socket.on("addView", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId, liveHistoryId } = await resolveLiveRoom(payload);
+      const userId = toObjectId(payload.userId);
+      if (!roomId || !liveHistoryId || !userId) return;
+      joinLiveRoom(roomId);
+      const existingView = await LiveBroadcastView.findOne({ userId, liveHistoryId }).select("_id").lean();
+
+      await LiveBroadcastView.updateOne(
+        { userId, liveHistoryId },
+        {
+          $set: {
+            userId,
+            liveHistoryId,
+            name: payload.name || payload.userName || "",
+            gender: payload.gender || "",
+            image: payload.image || "",
+            countryFlagImage: payload.countryFlagImage || "",
+            country: String(payload.country || "").toLowerCase(),
+            avatarFrame: payload.avatarFrame || payload.avatarFrameImage || "",
+            avatarFrameImage: payload.avatarFrame || payload.avatarFrameImage || "",
+            entrySvga: payload.entrySvga || "",
+            isVIP: !!payload.isVIP,
+            isAdd: true,
+            isUserBackgroundLive: !!payload.isUserBackgroundLive,
+            updatedAt: new Date(),
+          },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true },
+      );
+
+      const totalViews = await LiveBroadcastView.countDocuments({ liveHistoryId });
+      await Promise.all([
+        LiveBroadcaster.updateOne({ liveHistoryId }, { $set: { view: totalViews } }),
+        LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $set: { audienceCount: totalViews } }),
+      ]);
+      await emitLiveViewList(roomId, payload);
+      if (!existingView) emitRoomSystemComment(roomId, payload, "enter");
+    } catch (error) {
+      console.error("[addView] Error:", error);
+    }
+  });
+
+  socket.on("lessView", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId, liveHistoryId } = await resolveLiveRoom(payload);
+      const userId = toObjectId(payload.userId);
+      if (!roomId || !liveHistoryId || !userId) return;
+      const removedView = await LiveBroadcastView.findOne({ userId, liveHistoryId }).lean();
+      await LiveBroadcastView.deleteOne({ userId, liveHistoryId });
+      const totalViews = await LiveBroadcastView.countDocuments({ liveHistoryId });
+      await Promise.all([
+        LiveBroadcaster.updateOne({ liveHistoryId }, { $set: { view: totalViews } }),
+        LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $set: { audienceCount: totalViews } }),
+      ]);
+      await emitLiveViewList(roomId);
+      emitRoomSystemComment(roomId, { ...payload, ...(removedView || {}) }, "exit");
+      socket.leave(roomId);
+    } catch (error) {
+      console.error("[lessView] Error:", error);
+    }
+  });
+
+  socket.on("addParticipants", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      joinLiveRoom(roomId);
+      const live = await updateLiveRoomSeat(roomId, (seats) => {
+        const index = seatIndexFromPayload(seats, payload);
+        if (index < 0) return;
+        if (payload.userId) {
+          seats.forEach((seat, seatIndex) => {
+            if (seatIndex !== index && String(seat.userId || "") === String(payload.userId)) {
+              seats[seatIndex] = {
+                ...(seat || {}),
+                reserved: false,
+                name: "",
+                image: "",
+                avatarFrameImage: "",
+                country: "",
+                agoraUid: 0,
+                mute: 0,
+                userId: "",
+                isSpeaking: false,
+              };
+            }
+          });
+        }
+        seats[index] = {
+          ...(seats[index] || {}),
+          position: seats[index]?.position || index + 1,
+          reserved: true,
+          name: payload.name || "",
+          image: payload.image || "",
+          avatarFrameImage: payload.avatarFrame || payload.avatarFrameImage || "",
+          country: payload.country || "",
+          agoraUid: Number(payload.agoraUid || 0),
+          mute: Number(payload.mute || 0),
+          userId: payload.userId || "",
+          isSpeaking: false,
+        };
+      });
+      io.in(roomId).emit("addParticipants", JSON.stringify(normalizedPayload(payload, roomId)));
+      if (live) io.in(roomId).emit("seat", JSON.stringify(seatPayloadFromLive(live)));
+    } catch (error) {
+      console.error("[addParticipants] Error:", error);
+    }
+  });
+
+  socket.on("addRequested", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId, live } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      joinLiveRoom(roomId);
+      const outgoing = JSON.stringify(normalizedPayload({ ...payload, mute: Number(payload.mute || 0) }, roomId));
+      if (payload.request === true || payload.request === "true") {
+        io.in(roomId).emit("addRequested", outgoing);
+        const hostUserId = String(payload.liveUserId || live?.userId || live?.liveUserId || "");
+        if (hostUserId) io.in(`globalRoom:${hostUserId}`).emit("addRequested", outgoing);
+      } else {
+        io.in(roomId).emit("invite", outgoing);
+        if (payload.userId) io.in(`globalRoom:${payload.userId}`).emit("invite", outgoing);
+      }
+    } catch (error) {
+      console.error("[addRequested] Error:", error);
+    }
+  });
+
+  socket.on("lessParticipants", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      const live = await updateLiveRoomSeat(roomId, (seats) => {
+        const index = seatIndexFromPayload(seats, payload);
+        if (index < 0) return;
+        seats[index] = {
+          ...(seats[index] || {}),
+          reserved: false,
+          name: "",
+          image: "",
+          avatarFrameImage: "",
+          country: "",
+          agoraUid: 0,
+          mute: 0,
+          userId: "",
+          isSpeaking: false,
+        };
+      });
+      io.in(roomId).emit("lessParticipants", JSON.stringify(normalizedPayload(payload, roomId)));
+      if (live) io.in(roomId).emit("seat", JSON.stringify(seatPayloadFromLive(live)));
+    } catch (error) {
+      console.error("[lessParticipants] Error:", error);
+    }
+  });
+
+  socket.on("muteSeat", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      const live = await updateLiveRoomSeat(roomId, (seats) => {
+        const index = seatIndexFromPayload(seats, payload);
+        if (index >= 0) seats[index].mute = Number(payload.mute || 0);
+      });
+      io.in(roomId).emit("muteSeat", JSON.stringify(normalizedPayload(payload, roomId)));
+      if (live) io.in(roomId).emit("seat", JSON.stringify(seatPayloadFromLive(live)));
+    } catch (error) {
+      console.error("[muteSeat] Error:", error);
+    }
+  });
+
+  socket.on("lockSeat", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      const live = await updateLiveRoomSeat(roomId, (seats) => {
+        const index = seatIndexFromPayload(seats, payload);
+        if (index >= 0) seats[index].lock = payload.lock !== false;
+      });
+      io.in(roomId).emit("lockSeat", JSON.stringify(normalizedPayload(payload, roomId)));
+      if (live) io.in(roomId).emit("seat", JSON.stringify(seatPayloadFromLive(live)));
+    } catch (error) {
+      console.error("[lockSeat] Error:", error);
+    }
+  });
+
+  socket.on("normalUserGift", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId, liveHistoryId } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      joinLiveRoom(roomId);
+      io.in(roomId).emit("gift", JSON.stringify(normalizedPayload(payload, roomId)));
+      if (liveHistoryId) {
+        await LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $inc: { gifts: 1, coins: Number(payload.coin || 0) } });
+      }
+    } catch (error) {
+      console.error("[normalUserGift] Error:", error);
+    }
+  });
+
+  const endAudioRoom = async (data, outgoingEvent = "liveHostEnd") => {
+    const payload = parseSocketPayload(data);
+    const { roomId, liveHistoryId } = await resolveLiveRoom(payload);
+    if (!roomId || !liveHistoryId) return;
+    const outgoing = JSON.stringify(normalizedPayload(payload, roomId));
+    io.in(roomId).emit(outgoingEvent, outgoing);
+    io.in(roomId).emit("audioLiveHostRemove", outgoing);
+
+    const live = await LiveBroadcaster.findOne({ liveHistoryId }).lean();
+    const history = await LiveBroadcastHistory.findById(liveHistoryId).lean();
+    const endTime = moment().tz("Asia/Kolkata").format();
+    const start = history?.startTime ? moment.tz(history.startTime, "Asia/Kolkata") : moment();
+    const end = moment.tz(endTime, "Asia/Kolkata");
+    const duration = moment.utc(end.diff(start)).format("HH:mm:ss");
+
+    await Promise.all([
+      LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $set: { endTime, duration } }),
+      LiveBroadcastView.deleteMany({ liveHistoryId }),
+      LiveBroadcaster.deleteMany({ liveHistoryId }),
+      live?.hostId ? Host.updateOne({ _id: live.hostId }, { $set: { isLive: false, isBusy: false, liveHistoryId: null } }) : Promise.resolve(),
+      live?.userId ? User.updateOne({ _id: live.userId }, { $set: { isBusy: false } }) : Promise.resolve(),
+    ]);
+
+    io.socketsLeave(roomId);
+  };
+
+  socket.on("audioLiveHostRemove", async (data) => {
+    try {
+      await endAudioRoom(data, "liveHostEnd");
+    } catch (error) {
+      console.error("[audioLiveHostRemove] Error:", error);
+    }
+  });
+
+  socket.on("liveHostEnd", async (data) => {
+    try {
+      await endAudioRoom(data, "liveHostEnd");
+    } catch (error) {
+      console.error("[liveHostEnd] Error:", error);
+    }
+  });
+
+  socket.on("hostJoinAudioRoom", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      joinLiveRoom(roomId);
+      const outgoing = JSON.stringify(normalizedPayload(payload, roomId));
+      io.in(roomId).emit("hostJoinAudioRoom", outgoing);
+      await emitLiveViewList(roomId);
+      await emitSeatState(roomId);
+    } catch (error) {
+      console.error("[hostJoinAudioRoom] Error:", error);
+    }
+  });
+
+  socket.on("liveRejoin", async (data) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const { roomId } = await resolveLiveRoom(payload);
+      if (!roomId) return;
+      joinLiveRoom(roomId);
+      await emitLiveViewList(roomId);
+      await emitSeatState(roomId);
+    } catch (error) {
+      console.error("[liveRejoin] Error:", error);
+    }
+  });
+
+relayRoomEvent("sendReaction");
+relayRoomEvent("roomName");
+relayRoomEvent("roomWelcome");
+relayRoomEvent("roomImage");
+relayRoomEvent("changeTheme");
+  relayRoomEvent("updateBlockedList", "blockedListUpdated");
+  relayRoomEvent("blockedList");
+
   //chat
   socket.on("chatMessageSent", async (data) => {
     const parseData = JSON.parse(data);
