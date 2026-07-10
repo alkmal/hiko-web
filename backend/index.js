@@ -142,8 +142,20 @@ async function startServer() {
   const absoluteUrl = (value, req = null) => {
     const raw = textValue(value);
     if (!raw) return "";
-    if (/^https?:\/\//i.test(raw) || raw.startsWith("content://") || raw.startsWith("file://")) return raw;
-    return `${publicBaseUrl(req)}/${raw.replace(/^\/+/, "")}`;
+    if (/^https?:\/\//i.test(raw)) {
+      try {
+        const asset = new URL(raw);
+        const base = new URL(publicBaseUrl(req));
+        if (asset.host === base.host) {
+          return `/${`${asset.pathname}${asset.search}`.replace(/^\/+/, "")}`;
+        }
+      } catch (error) {
+        return raw;
+      }
+      return raw;
+    }
+    if (raw.startsWith("content://") || raw.startsWith("file://")) return raw;
+    return `/${raw.replace(/^\/+/, "")}`;
   };
   const firstUploadedFile = (req, field) => req.files?.[field]?.[0] || null;
   const splitCsv = (value) => textValue(value).split(",").map((item) => item.trim()).filter(Boolean);
@@ -201,7 +213,8 @@ async function startServer() {
     icon: gift.icon || gift.image || gift.svgaImage || "",
     svgaImage: gift.svgaImage || "",
     type: Number(gift.type || 1),
-    category: category || gift.category || null,
+    category: String(gift.giftCategoryId || category?._id || gift.category || ""),
+    giftCategoryId: String(gift.giftCategoryId || category?._id || gift.category || ""),
   });
 
   const getGiftCategories = async () => {
@@ -408,10 +421,18 @@ async function startServer() {
     createdAt: video.createdAt || new Date(),
   });
 
+  const isPlayableVideoPath = (value = "") => {
+    const path = String(value || "").trim();
+    if (!path || /demo-video/i.test(path)) return false;
+    return /\.(mp4|m4v|mov|webm|m3u8)(\?|$)/i.test(path);
+  };
+
   const fetchVideosForClient = async (query = {}, req, limit = 50) => {
     const videos = await collection("videos").find(query).sort({ createdAt: -1, _id: -1 }).limit(limit).toArray();
     const users = await peopleMapFor(videos);
-    return videos.map((video) => formatVideoForClient(video, users.get(String(video.userId)), req));
+    return videos
+      .filter((video) => isPlayableVideoPath(video.video))
+      .map((video) => formatVideoForClient(video, users.get(String(video.userId)), req));
   };
 
   app.all("/user/loginSignup", async (req, res) => {
@@ -1640,21 +1661,66 @@ async function startServer() {
         ...(currentUserId ? { userId: { $ne: currentUserId } } : {}),
         ...(country && country !== "global" && country !== "all" ? { country } : {}),
       };
+      const liveStaleAfterMs = Number(process.env.LIVE_STALE_AFTER_MS || 12 * 60 * 60 * 1000);
+      const liveStaleCutoff = new Date(Date.now() - liveStaleAfterMs);
 
-      const [total, liveDocs] = await Promise.all([
-        collection("livebroadcasters").countDocuments(filter),
-        collection("livebroadcasters").find(filter).sort({ createdAt: -1 }).skip(start).limit(limit).toArray(),
+      const staleLives = await collection("livebroadcasters").aggregate([
+        { $match: { disconnect: { $ne: true } } },
+        { $lookup: { from: "hosts", localField: "hostId", foreignField: "_id", as: "hostDoc" } },
+        { $unwind: { path: "$hostDoc", preserveNullAndEmptyArrays: true } },
+        {
+          $match: {
+            $or: [
+              { hostDoc: null },
+              { "hostDoc.isLive": { $ne: true } },
+              { "hostDoc.isOnline": { $ne: true } },
+              { "hostDoc.isBusy": { $ne: true } },
+              { "hostDoc.isBlock": true },
+              { updatedAt: { $lt: liveStaleCutoff } },
+            ],
+          },
+        },
+        { $project: { liveHistoryId: 1, hostId: 1 } },
+      ]).toArray();
+      const staleHistoryIds = staleLives.map((live) => live.liveHistoryId).filter(Boolean);
+      const staleHostIds = idsFrom(staleLives.map((live) => live.hostId));
+      if (staleHistoryIds.length) {
+        await Promise.all([
+          collection("livebroadcastviews").deleteMany({ liveHistoryId: { $in: staleHistoryIds } }),
+          collection("livebroadcasters").deleteMany({ liveHistoryId: { $in: staleHistoryIds } }),
+          staleHostIds.length
+            ? collection("hosts").updateMany({ _id: { $in: staleHostIds } }, { $set: { isLive: false, isBusy: false, liveHistoryId: null, updatedAt: new Date() } })
+            : Promise.resolve(),
+        ]);
+      }
+
+      const livePipeline = [
+        { $match: { ...filter, updatedAt: { $gte: liveStaleCutoff } } },
+        { $lookup: { from: "hosts", localField: "hostId", foreignField: "_id", as: "hostDoc" } },
+        { $unwind: { path: "$hostDoc", preserveNullAndEmptyArrays: false } },
+        {
+          $match: {
+            "hostDoc.isLive": true,
+            "hostDoc.isOnline": true,
+            "hostDoc.isBusy": true,
+            "hostDoc.isBlock": { $ne: true },
+          },
+        },
+        { $sort: { createdAt: -1 } },
+      ];
+
+      const [totalResult, liveDocs] = await Promise.all([
+        collection("livebroadcasters").aggregate([...livePipeline, { $count: "total" }]).toArray(),
+        collection("livebroadcasters").aggregate([...livePipeline, { $skip: start }, { $limit: limit }]).toArray(),
       ]);
+      const total = totalResult[0]?.total || 0;
 
       const userIds = idsFrom(liveDocs.map((live) => live.userId || live.liveUserId));
-      const hostIds = idsFrom(liveDocs.map((live) => live.hostId));
-      const [users, hosts] = await Promise.all([
+      const [users] = await Promise.all([
         userIds.length ? collection("users").find({ _id: { $in: userIds } }).toArray() : [],
-        hostIds.length ? collection("hosts").find({ _id: { $in: hostIds } }).toArray() : [],
       ]);
       const userMap = new Map(users.map((user) => [String(user._id), user]));
-      const hostMap = new Map(hosts.map((host) => [String(host._id), host]));
-      const liveUser = liveDocs.map((live) => normalizeLiveUser(live, userMap.get(String(live.userId)) || {}, hostMap.get(String(live.hostId)) || {}));
+      const liveUser = liveDocs.map((live) => normalizeLiveUser(live, userMap.get(String(live.userId)) || {}, live.hostDoc || {}));
 
       return res.status(200).json({ status: true, message: "Live users fetched", liveUser, users: liveUser, data: liveUser, total });
     } catch (error) {
@@ -1668,11 +1734,16 @@ async function startServer() {
       if (!userObjectId) return res.status(200).json({ status: true, message: "User is not live", liveUser: null, isLive: false });
       const live = await collection("livebroadcasters").findOne({ userId: userObjectId });
       const user = await collection("users").findOne({ _id: userObjectId });
+      const host = live?.hostId ? await collection("hosts").findOne({ _id: live.hostId }) : null;
+      const isLive = !!(live && host && host.isLive === true && host.isOnline === true && host.isBusy === true && host.isBlock !== true);
+      if (live && !isLive) {
+        await endLiveSession({ userId: userObjectId, liveStreamingId: live.liveHistoryId });
+      }
       return res.status(200).json({
         status: true,
-        message: live ? "User is live" : "User is not live",
-        liveUser: live ? normalizeLiveUser(live, user || {}) : null,
-        isLive: !!live,
+        message: isLive ? "User is live" : "User is not live",
+        liveUser: isLive ? normalizeLiveUser(live, user || {}, host || {}) : null,
+        isLive,
       });
     } catch (error) {
       return withCompatError(res, error);
@@ -1932,7 +2003,18 @@ async function startServer() {
     try {
       const userObjectId = toObjectId(req.query.userId);
       const live = userObjectId ? await collection("livebroadcasters").findOne({ userId: userObjectId }) : null;
-      return res.status(200).json({ status: true, message: live ? "User is live" : "User is not live", liveUser: live ? normalizeLiveUser(live) : null, isLive: !!live });
+      const user = userObjectId ? await collection("users").findOne({ _id: userObjectId }) : null;
+      const host = live?.hostId ? await collection("hosts").findOne({ _id: live.hostId }) : null;
+      const isLive = !!(live && host && host.isLive === true && host.isOnline === true && host.isBusy === true && host.isBlock !== true);
+      if (live && !isLive) {
+        await endLiveSession({ userId: userObjectId, liveStreamingId: live.liveHistoryId });
+      }
+      return res.status(200).json({
+        status: true,
+        message: isLive ? "User is live" : "User is not live",
+        liveUser: isLive ? normalizeLiveUser(live, user || {}, host || {}) : null,
+        isLive,
+      });
     } catch (error) {
       return withCompatError(res, error);
     }

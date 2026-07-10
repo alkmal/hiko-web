@@ -13,5 +13,6 @@ const validateUserToken = require("../../middleware/validateUserToken.middleware
 
 //get gifts grouped by category
 route.get("/fetchGiftList", checkAccessWithSecretKey(), validateUserToken, GiftController.fetchGiftList);
+route.get("/:giftCategoryId", checkAccessWithSecretKey(), validateUserToken, GiftController.fetchGiftList);
 
 module.exports = route;

@@ -192,6 +192,7 @@ io.on("connection", async (socket) => {
       ...live,
       _id: liveId,
       id: liveId,
+      liveHistoryId,
       liveStreamingId: liveHistoryId,
       liveUserId: String(live.userId || live.liveUserId || live.hostId || ""),
       agoraUID: Number(live.agoraUID ?? live.agoraUid ?? 1),
@@ -233,11 +234,27 @@ io.on("connection", async (socket) => {
   };
 
   const seatIndexFromPayload = (seats, payload) => {
+    const explicitIndex = Number(payload.seatIndex ?? -1);
+    if (Number.isInteger(explicitIndex) && explicitIndex >= 0 && explicitIndex < seats.length) return explicitIndex;
+
     const raw = Number(payload.position);
     if (Number.isInteger(raw) && raw >= 0 && raw < seats.length) return raw;
     const byPosition = seats.findIndex((seat) => Number(seat.position) === raw);
     return byPosition >= 0 ? byPosition : -1;
   };
+
+  const clearSeat = (seat = {}) => ({
+    ...(seat || {}),
+    reserved: false,
+    name: "",
+    image: "",
+    avatarFrameImage: "",
+    country: "",
+    agoraUid: 0,
+    mute: 0,
+    userId: "",
+    isSpeaking: false,
+  });
 
   const relayRoomEvent = (incomingEvent, outgoingEvent = incomingEvent) => {
     socket.on(incomingEvent, async (data) => {
@@ -347,24 +364,21 @@ io.on("connection", async (socket) => {
       const { roomId } = await resolveLiveRoom(payload);
       if (!roomId) return;
       joinLiveRoom(roomId);
+      let accepted = false;
+      let rejected = false;
       const live = await updateLiveRoomSeat(roomId, (seats) => {
         const index = seatIndexFromPayload(seats, payload);
         if (index < 0) return;
+        const currentSeatUserId = String(seats[index]?.userId || "");
+        const incomingUserId = String(payload.userId || "");
+        if (currentSeatUserId && incomingUserId && currentSeatUserId !== incomingUserId) {
+          rejected = true;
+          return;
+        }
         if (payload.userId) {
           seats.forEach((seat, seatIndex) => {
             if (seatIndex !== index && String(seat.userId || "") === String(payload.userId)) {
-              seats[seatIndex] = {
-                ...(seat || {}),
-                reserved: false,
-                name: "",
-                image: "",
-                avatarFrameImage: "",
-                country: "",
-                agoraUid: 0,
-                mute: 0,
-                userId: "",
-                isSpeaking: false,
-              };
+              seats[seatIndex] = clearSeat(seat);
             }
           });
         }
@@ -381,8 +395,13 @@ io.on("connection", async (socket) => {
           userId: payload.userId || "",
           isSpeaking: false,
         };
+        accepted = true;
       });
-      io.in(roomId).emit("addParticipants", JSON.stringify(normalizedPayload(payload, roomId)));
+      if (accepted) {
+        io.in(roomId).emit("addParticipants", JSON.stringify(normalizedPayload(payload, roomId)));
+      } else if (rejected) {
+        socket.emit("seatBusy", JSON.stringify(normalizedPayload(payload, roomId)));
+      }
       if (live) io.in(roomId).emit("seat", JSON.stringify(seatPayloadFromLive(live)));
     } catch (error) {
       console.error("[addParticipants] Error:", error);
@@ -416,19 +435,21 @@ io.on("connection", async (socket) => {
       if (!roomId) return;
       const live = await updateLiveRoomSeat(roomId, (seats) => {
         const index = seatIndexFromPayload(seats, payload);
-        if (index < 0) return;
-        seats[index] = {
-          ...(seats[index] || {}),
-          reserved: false,
-          name: "",
-          image: "",
-          avatarFrameImage: "",
-          country: "",
-          agoraUid: 0,
-          mute: 0,
-          userId: "",
-          isSpeaking: false,
-        };
+        const targetUserId = String(payload.removedUserID || payload.userId || "");
+        if (index >= 0) {
+          const currentSeatUserId = String(seats[index]?.userId || "");
+          if (!targetUserId || !currentSeatUserId || currentSeatUserId === targetUserId) {
+            seats[index] = clearSeat(seats[index]);
+          }
+          return;
+        }
+        if (targetUserId) {
+          seats.forEach((seat, seatIndex) => {
+            if (String(seat.userId || "") === targetUserId) {
+              seats[seatIndex] = clearSeat(seat);
+            }
+          });
+        }
       });
       io.in(roomId).emit("lessParticipants", JSON.stringify(normalizedPayload(payload, roomId)));
       if (live) io.in(roomId).emit("seat", JSON.stringify(seatPayloadFromLive(live)));
@@ -529,9 +550,14 @@ io.on("connection", async (socket) => {
   socket.on("hostJoinAudioRoom", async (data) => {
     try {
       const payload = parseSocketPayload(data);
-      const { roomId } = await resolveLiveRoom(payload);
+      const { roomId, liveHistoryId, live } = await resolveLiveRoom(payload);
       if (!roomId) return;
       joinLiveRoom(roomId);
+      const now = new Date();
+      await Promise.all([
+        liveHistoryId ? LiveBroadcaster.updateOne({ liveHistoryId }, { $set: { updatedAt: now } }) : Promise.resolve(),
+        live?.hostId ? Host.updateOne({ _id: live.hostId }, { $set: { isLive: true, isBusy: true, updatedAt: now } }) : Promise.resolve(),
+      ]);
       const outgoing = JSON.stringify(normalizedPayload(payload, roomId));
       io.in(roomId).emit("hostJoinAudioRoom", outgoing);
       await emitLiveViewList(roomId);
@@ -562,28 +588,95 @@ relayRoomEvent("changeTheme");
   relayRoomEvent("updateBlockedList", "blockedListUpdated");
   relayRoomEvent("blockedList");
 
+  const chatActorProjection = "_id name image fcmToken isBlock coin chatRate agencyId isVip isVIP isFake";
+
+  const normalizeChatPayload = (data) => {
+    const payload = parseSocketPayload(data);
+    const normalized = { ...payload };
+    normalized.chatTopicId = normalized.chatTopicId || normalized.topic;
+    if (!normalized.topic && normalized.chatTopicId) normalized.topic = String(normalized.chatTopicId);
+
+    const rawType = String(normalized.messageType ?? "").toLowerCase();
+    normalized.dbMessageType = rawType === "2" || rawType === "image" ? 2 : 1;
+    normalized.clientMessageType = normalized.dbMessageType === 2 ? "image" : "message";
+
+    return normalized;
+  };
+
+  const resolveChatActor = async (actorId, preferredRole = "") => {
+    if (!actorId || !mongoose.Types.ObjectId.isValid(String(actorId))) return null;
+    const id = String(actorId);
+    const loadUser = () => User.findById(id).lean().select(chatActorProjection);
+    const loadHost = () => Host.findById(id).lean().select(chatActorProjection);
+
+    if (preferredRole === "user") {
+      const user = await loadUser();
+      if (user) return { role: "user", doc: user };
+    }
+
+    if (preferredRole === "host") {
+      const host = await loadHost();
+      if (host) return { role: "host", doc: host };
+    }
+
+    const user = await loadUser();
+    if (user) return { role: "user", doc: user };
+
+    const host = await loadHost();
+    if (host) return { role: "host", doc: host };
+
+    return null;
+  };
+
+  const inferChatReceiverId = (chatTopic, senderId) => {
+    if (!chatTopic || !senderId) return null;
+    const sender = String(senderId);
+    const topicSender = chatTopic.senderId ? String(chatTopic.senderId) : "";
+    const topicReceiver = chatTopic.receiverId ? String(chatTopic.receiverId) : "";
+    return sender === topicSender ? topicReceiver : topicSender;
+  };
+
+  const emitToChatParticipants = (chatTopic, eventName, payload) => {
+    const rooms = [...new Set([chatTopic?.senderId, chatTopic?.receiverId].filter(Boolean).map((id) => String(id)))];
+    rooms.forEach((userId) => io.in("globalRoom:" + userId).emit(eventName, payload));
+  };
+
+  const emitChatMessageCompat = (chatTopic, chatItem, modernEventData) => {
+    emitToChatParticipants(chatTopic, "chat", JSON.stringify(chatItem));
+    emitToChatParticipants(chatTopic, "chatMessageSent", modernEventData);
+  };
+
+  const emitChatGiftCompat = (chatTopic, eventData) => {
+    emitToChatParticipants(chatTopic, "chatOrCallGiftSent", JSON.stringify(eventData));
+    emitToChatParticipants(chatTopic, "chatGiftSent", eventData);
+  };
+
   //chat
-  socket.on("chatMessageSent", async (data) => {
-    const parseData = JSON.parse(data);
+  const handleChatMessageSent = async (data) => {
+    const parseData = normalizeChatPayload(data);
     console.log("🔹 Data in chatMessageSent:", parseData);
 
-    let senderPromise, receiverPromise;
-
-    if (parseData?.senderRole === "user") {
-      senderPromise = User.findById(parseData?.senderId).lean().select("_id name image coin isVip");
-    } else if (parseData?.senderRole === "host") {
-      senderPromise = Host.findById(parseData?.senderId).lean().select("_id name image isFake coin");
+    const chatTopic = await ChatTopic.findById(parseData?.chatTopicId).lean().select("_id senderId receiverId chatId messageCount");
+    if (!chatTopic) {
+      console.log("Chat topic not found");
+      return;
     }
 
-    if (parseData?.receiverRole === "host") {
-      receiverPromise = Host.findById(parseData?.receiverId).lean().select("_id name image fcmToken isBlock coin chatRate agencyId");
-    } else if (parseData?.receiverRole === "user") {
-      receiverPromise = User.findById(parseData?.receiverId).lean().select("_id name image fcmToken isBlock coin");
-    }
+    parseData.receiverId = parseData.receiverId || inferChatReceiverId(chatTopic, parseData.senderId);
 
-    const chatTopicPromise = ChatTopic.findById(parseData?.chatTopicId).lean().select("_id senderId receiverId chatId messageCount");
+    const [uniqueId, senderActor, receiverActor] = await Promise.all([
+      generateHistoryUniqueId(),
+      resolveChatActor(parseData?.senderId, parseData?.senderRole),
+      resolveChatActor(parseData?.receiverId, parseData?.receiverRole),
+    ]);
 
-    const [uniqueId, sender, receiver, chatTopic] = await Promise.all([generateHistoryUniqueId(), senderPromise, receiverPromise, chatTopicPromise]);
+    const sender = senderActor?.doc;
+    const receiver = receiverActor?.doc;
+    parseData.senderRole = parseData.senderRole || senderActor?.role || "";
+    parseData.receiverRole = parseData.receiverRole || receiverActor?.role || "";
+    parseData.topic = String(chatTopic._id);
+    parseData.chatTopicId = String(chatTopic._id);
+    parseData.receiverId = parseData.receiverId ? String(parseData.receiverId) : "";
 
     if (!sender) {
       console.log("❌ Sender not found");
@@ -600,12 +693,12 @@ relayRoomEvent("changeTheme");
       return;
     }
 
-    if (parseData?.messageType == 1) {
+    if (parseData?.dbMessageType === 1) {
       if (parseData.senderRole === "user" && parseData.receiverRole === "host") {
         let maxFreeChatMessages = settingJSON.maxFreeChatMessages || 10;
 
         //Check if sender is VIP
-        if (sender?.isVip) {
+        if (sender?.isVip || sender?.isVIP) {
           const vipPrivilege = await VipPlanPrivilege.findOne().select("freeMessages").lean();
           if (vipPrivilege?.freeMessages) {
             maxFreeChatMessages = vipPrivilege.freeMessages;
@@ -623,7 +716,7 @@ relayRoomEvent("changeTheme");
       }
 
       const chat = new Chat({
-        messageType: parseData?.messageType,
+        messageType: parseData?.dbMessageType,
         senderId: parseData?.senderId,
         message: parseData?.message,
         image: parseData?.image || "",
@@ -642,13 +735,30 @@ relayRoomEvent("changeTheme");
         ),
       ]);
 
+      const chatItem = {
+        _id: chat._id.toString(),
+        senderId: String(parseData.senderId || ""),
+        messageType: parseData.clientMessageType,
+        topic: String(chatTopic._id),
+        chatTopicId: String(chatTopic._id),
+        message: chat.message || "",
+        image: chat.image || "",
+        date: chat.date,
+      };
+
+      const modernData = JSON.stringify({
+        ...parseData,
+        messageType: parseData.dbMessageType,
+        _id: chat._id.toString(),
+        messageId: chat._id.toString(),
+      });
+
       const eventData = {
-        data,
+        data: modernData,
         messageId: chat._id.toString(),
       };
 
-      io.in("globalRoom:" + chatTopic?.senderId?.toString()).emit("chatMessageSent", eventData);
-      io.in("globalRoom:" + chatTopic?.receiverId?.toString()).emit("chatMessageSent", eventData);
+      emitChatMessageCompat(chatTopic, chatItem, eventData);
 
       if (parseData.senderRole === "user" && parseData.receiverRole === "host") {
         const maxFreeChatMessages = settingJSON.maxFreeChatMessages || 10;
@@ -769,38 +879,59 @@ relayRoomEvent("changeTheme");
     } else {
       console.log("ℹ️ Other message type received");
 
-      const eventData = {
-        data,
-        messageId: parseData?.messageId?.toString() || "",
+      const messageId = parseData?.messageId?.toString() || parseData?._id?.toString() || "";
+      const chatItem = {
+        _id: messageId,
+        senderId: String(parseData.senderId || ""),
+        messageType: parseData.clientMessageType,
+        topic: String(chatTopic._id),
+        chatTopicId: String(chatTopic._id),
+        message: parseData.message || "",
+        image: parseData.image || "",
+        date: parseData.date || new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
       };
 
-      io.in("globalRoom:" + chatTopic?.senderId?.toString()).emit("chatMessageSent", eventData);
-      io.in("globalRoom:" + chatTopic?.receiverId?.toString()).emit("chatMessageSent", eventData);
-    }
-  });
+      const eventData = {
+        data: JSON.stringify({ ...parseData, messageType: parseData.dbMessageType }),
+        messageId,
+      };
 
-  socket.on("chatGiftSent", async (data) => {
-    const parseData = JSON.parse(data);
+      emitChatMessageCompat(chatTopic, chatItem, eventData);
+    }
+  };
+
+  socket.on("chatMessageSent", handleChatMessageSent);
+  socket.on("chat", handleChatMessageSent);
+
+  const handleChatGiftSent = async (data) => {
+    const parseData = parseSocketPayload(data);
+    parseData.chatTopicId = parseData.chatTopicId || parseData.topic;
     console.log("🎁 Data in chatGiftSent:", parseData);
 
-    let senderPromise, receiverPromise;
-
-    if (parseData?.senderRole === "user") {
-      senderPromise = User.findById(parseData?.senderId).lean().select("_id name coin name image");
-    } else if (parseData?.senderRole === "host") {
-      senderPromise = Host.findById(parseData?.senderId).lean().select("_id name coin name image");
-    }
-
-    if (parseData?.receiverRole === "host") {
-      receiverPromise = Host.findById(parseData?.receiverId).lean().select("_id fcmToken isBlock coin agencyId name image");
-    } else if (parseData?.receiverRole === "user") {
-      receiverPromise = User.findById(parseData?.receiverId).lean().select("_id fcmToken isBlock coin name image");
-    }
-
     const chatTopicPromise = ChatTopic.findById(parseData?.chatTopicId).lean().select("_id senderId receiverId chatId");
-    const giftPromise = Gift.findById(parseData?.giftId).lean().select("_id coin image svgaImage type");
+    const giftPromise = Gift.findById(parseData?.giftId).lean().select("_id coin image svgaImage type giftCategoryId");
+    const chatTopic = await chatTopicPromise;
+    if (!chatTopic) {
+      console.log("Chat topic not found");
+      return;
+    }
 
-    const [uniqueId, sender, receiver, chatTopic, gift] = await Promise.all([generateHistoryUniqueId(), senderPromise, receiverPromise, chatTopicPromise, giftPromise]);
+    parseData.receiverId = parseData.receiverId || inferChatReceiverId(chatTopic, parseData.senderId);
+
+    const [uniqueId, senderActor, receiverActor, gift] = await Promise.all([
+      generateHistoryUniqueId(),
+      resolveChatActor(parseData?.senderId, parseData?.senderRole),
+      resolveChatActor(parseData?.receiverId, parseData?.receiverRole),
+      giftPromise,
+    ]);
+
+    const sender = senderActor?.doc;
+    const receiver = receiverActor?.doc;
+    parseData.senderRole = parseData.senderRole || senderActor?.role || "";
+    parseData.receiverRole = parseData.receiverRole || receiverActor?.role || "";
+    parseData.topic = String(chatTopic._id);
+    parseData.chatTopicId = String(chatTopic._id);
+    parseData.receiverId = parseData.receiverId ? String(parseData.receiverId) : "";
 
     if (!sender) {
       console.log("❌ Sender not found");
@@ -856,13 +987,31 @@ relayRoomEvent("changeTheme");
       ),
     ]);
 
+    const giftData = parseData.gift || {
+      _id: String(gift._id),
+      coin: gift.coin || 0,
+      image: gift.image || "",
+      svgaImage: gift.svgaImage || "",
+      type: gift.type || 1,
+      category: String(gift.giftCategoryId || ""),
+      giftCategoryId: String(gift.giftCategoryId || ""),
+      count: giftCount,
+    };
+
     const eventData = {
-      data,
+      data: {
+        ...parseData,
+        eventType: parseData.eventType || "chat",
+        gift: giftData,
+        giftCount,
+        chatTopicId: String(chatTopic._id),
+        topic: String(chatTopic._id),
+        messageId: chat._id.toString(),
+      },
       messageId: chat._id.toString(),
     };
 
-    io.in("globalRoom:" + chatTopic?.senderId?.toString()).emit("chatGiftSent", eventData);
-    io.in("globalRoom:" + chatTopic?.receiverId?.toString()).emit("chatGiftSent", eventData);
+    emitChatGiftCompat(chatTopic, eventData);
 
     let adminShare = 0;
     let hostEarnings = 0;
@@ -964,7 +1113,10 @@ relayRoomEvent("changeTheme");
         console.log("❌ Error sending FCM message:", error);
       }
     }
-  });
+  };
+
+  socket.on("chatGiftSent", handleChatGiftSent);
+  socket.on("chatOrCallGiftSent", handleChatGiftSent);
 
   socket.on("chatMessageSeen", async (data) => {
     try {

@@ -13,6 +13,40 @@ const admin = require("../../util/privateKey");
 //deletefile
 const { deleteFile } = require("../../util/deletefile");
 
+const notificationImage = (req) => (req.file ? `/${req.file.path.replace(/\\/g, "/").replace(/^\/+/, "")}` : "");
+
+const firebasePayload = ({ token, tokens, title, message, image, data = {} }) => {
+  const cleanTitle = (title || "Vola").trim();
+  const cleanMessage = (message || "").trim();
+  const payload = {
+    notification: {
+      title: cleanTitle,
+      body: cleanMessage,
+      ...(image ? { imageUrl: image.startsWith("http") ? image : `https://vola.alkmal.com${image}` } : {}),
+    },
+    data: {
+      type: data.type || "ADMIN",
+      title: cleanTitle,
+      body: cleanMessage,
+      message: cleanMessage,
+      image,
+      data: data.data || "",
+      ...data,
+    },
+  };
+  if (token) payload.token = token;
+  if (tokens) payload.tokens = tokens;
+  return payload;
+};
+
+const ensureFirebaseMessaging = async () => {
+  const adminInstance = await admin;
+  if (!adminInstance.apps?.length) {
+    throw new Error("Firebase Admin SDK is not configured. Add a valid Firebase service account privateKey in settings.");
+  }
+  return adminInstance.messaging();
+};
+
 //sending a notification from admin to a specific user
 exports.sendNotificationToSingleUserByAdmin = async (req, res) => {
   try {
@@ -45,41 +79,26 @@ exports.sendNotificationToSingleUserByAdmin = async (req, res) => {
     }
 
     try {
-      res.status(200).json({ status: true, message: "Notification sent successfully." });
+      const image = notificationImage(req);
+      const notificationPayload = firebasePayload({ token: user.fcmToken, title, message, image });
+      const messaging = await ensureFirebaseMessaging();
+      const response = await messaging.send(notificationPayload);
+      console.log("Successfully sent with response: ", response);
 
-      const notificationPayload = {
-        token: user.fcmToken,
-        data: {
-          title: title.trim(),
-          body: message.trim(),
-          image: req.file ? req.file.path : "",
-        },
-      };
+      await new Notification({
+        user: user._id,
+        notificationPersonType: 1, // 1 = User
+        title: title.trim(),
+        message: message.trim(),
+        image,
+        date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+      }).save();
 
-      const adminPromise = await admin;
-      adminPromise
-        .messaging()
-        .send(notificationPayload)
-        .then(async (response) => {
-          console.log("Successfully sent with response: ", response);
-
-          await new Notification({
-            user: user._id,
-            notificationPersonType: 1, // 1 = User
-            title: title.trim(),
-            message: message.trim(),
-            image: req.file ? req.file.path : "",
-            date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
-          }).save();
-        })
-        .catch((error) => {
-          if (req.file) deleteFile(req.file);
-          console.log("Error sending message:      ", error);
-        });
+      return res.status(200).json({ status: true, message: "Notification sent successfully." });
     } catch (error) {
       if (req.file) deleteFile(req.file);
       console.error("Error sending notification:", error);
-      return res.status(200).json({ status: false, message: "Failed to send notification." });
+      return res.status(200).json({ status: false, message: error.message || "Failed to send notification." });
     }
   } catch (error) {
     if (req.file) deleteFile(req.file);
@@ -120,41 +139,26 @@ exports.sendNotificationToSingleHostByAdmin = async (req, res) => {
     }
 
     try {
-      res.status(200).json({ status: true, message: "Notification sent successfully." });
+      const image = notificationImage(req);
+      const notificationPayload = firebasePayload({ token: host.fcmToken, title, message, image });
+      const messaging = await ensureFirebaseMessaging();
+      const response = await messaging.send(notificationPayload);
+      console.log("Successfully sent with response: ", response);
 
-      const notificationPayload = {
-        token: host.fcmToken,
-        data: {
-          title: title.trim(),
-          body: message.trim(),
-          image: req.file ? req.file.path : "",
-        },
-      };
+      await new Notification({
+        host: host._id,
+        notificationPersonType: 2, // 2 = Host
+        title: title.trim(),
+        message: message.trim(),
+        image,
+        date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+      }).save();
 
-      const adminPromise = await admin;
-      adminPromise
-        .messaging()
-        .send(notificationPayload)
-        .then(async (response) => {
-          console.log("Successfully sent with response: ", response);
-
-          await new Notification({
-            host: host._id,
-            notificationPersonType: 2, // 2 = Host
-            title: title.trim(),
-            message: message.trim(),
-            image: req.file ? req.file.path : "",
-            date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
-          }).save();
-        })
-        .catch((error) => {
-          if (req.file) deleteFile(req.file);
-          console.log("Error sending message:      ", error);
-        });
+      return res.status(200).json({ status: true, message: "Notification sent successfully." });
     } catch (error) {
       if (req.file) deleteFile(req.file);
       console.error("Error sending notification:", error);
-      return res.status(200).json({ status: false, message: "Failed to send notification." });
+      return res.status(200).json({ status: false, message: error.message || "Failed to send notification." });
     }
   } catch (error) {
     if (req.file) deleteFile(req.file);
@@ -167,7 +171,7 @@ exports.sendNotificationToSingleHostByAdmin = async (req, res) => {
 exports.sendNotifications = async (req, res) => {
   try {
     const { notificationType, title, message } = req.body;
-    const image = req.file ? req.file.path : "";
+    const image = notificationImage(req);
     const date = new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
 
     let targets = [];
@@ -203,55 +207,55 @@ exports.sendNotifications = async (req, res) => {
       if (item.fcmToken?.trim()) tokens.push(item.fcmToken);
     });
 
-    if (notifications.length) {
+    if (!tokens.length) {
+      if (notifications.length) {
+        await Notification.insertMany(notifications);
+      }
+      return res.status(200).json({ status: false, message: "No valid FCM tokens to send." });
+    }
+
+    const messaging = await ensureFirebaseMessaging();
+    const chunkSize = 500;
+    const batches = [];
+
+    for (let i = 0; i < tokens.length; i += chunkSize) {
+      batches.push(
+        messaging.sendEachForMulticast(firebasePayload({
+          tokens: tokens.slice(i, i + chunkSize),
+          title: title || "Default Title",
+          message: message || "Default Message",
+          image,
+        })),
+      );
+    }
+
+    const results = await Promise.all(batches);
+
+    let totalSuccess = 0;
+    let totalFailure = 0;
+
+    results.forEach((batchResult, batchIndex) => {
+      totalSuccess += batchResult.successCount;
+      totalFailure += batchResult.failureCount;
+
+      batchResult.responses.forEach((resp) => {
+        if (!resp.success) {
+          console.error(`FCM TOKEN FAILED (batch ${batchIndex}):`, resp.error?.message);
+        }
+      });
+    });
+
+    console.log("BULK FCM SUMMARY:", {
+      totalTokens: tokens.length,
+      totalSuccess,
+      totalFailure,
+    });
+
+    if (totalSuccess > 0 && notifications.length) {
       await Notification.insertMany(notifications);
     }
 
-    res.status(200).json({ status: true, message: "Notification sent successfully." });
-
-    if (tokens.length > 0) {
-      const adminInstance = await admin;
-      const chunkSize = 500;
-      const batches = [];
-
-      for (let i = 0; i < tokens.length; i += chunkSize) {
-        batches.push(
-          adminInstance.messaging().sendEachForMulticast({
-            tokens: tokens.slice(i, i + chunkSize),
-            data: {
-              title: title || "Default Title",
-              body: message || "Default Message",
-              image,
-            },
-          }),
-        );
-      }
-
-      const results = await Promise.all(batches);
-
-      let totalSuccess = 0;
-      let totalFailure = 0;
-
-      results.forEach((batchResult, batchIndex) => {
-        totalSuccess += batchResult.successCount;
-        totalFailure += batchResult.failureCount;
-
-        batchResult.responses.forEach((resp, idx) => {
-          if (!resp.success) {
-            console.error(`FCM TOKEN FAILED (batch ${batchIndex}):`, resp.error?.message);
-          }
-        });
-      });
-
-      console.log("BULK FCM SUMMARY:", {
-        totalTokens: tokens.length,
-        totalSuccess,
-        totalFailure,
-      });
-    } else {
-      if (req.file) deleteFile(req.file);
-      console.warn("No valid FCM tokens to send.");
-    }
+    return res.status(200).json({ status: totalSuccess > 0, message: `Notification sent. success=${totalSuccess}, failure=${totalFailure}` });
   } catch (error) {
     if (req.file) deleteFile(req.file);
     console.error("sendNotifications error:", error);
