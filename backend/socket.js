@@ -111,11 +111,26 @@ io.on("connection", async (socket) => {
     }
   };
 
-  const emitRoomSystemComment = (roomId, payload = {}, action = "enter") => {
+  const liveRoomEvents = () => mongoose.connection.db.collection("liveroomevents");
+
+  const saveRoomEvent = async (roomId, payload = {}, eventType = "comment") => {
+    if (!roomId) return null;
+    const event = { ...normalizedPayload(payload, roomId), roomId, eventType, createdAt: new Date() };
+    const result = await liveRoomEvents().insertOne(event);
+    return { ...event, _id: String(result.insertedId) };
+  };
+
+  const emitRoomHistory = async (roomId) => {
+    if (!roomId) return;
+    const events = await liveRoomEvents().find({ roomId: String(roomId) }).sort({ createdAt: -1 }).limit(100).toArray();
+    socket.emit("roomHistory", JSON.stringify(events.map((event) => ({ ...event, _id: String(event._id) }))));
+  };
+
+  const emitRoomSystemComment = async (roomId, payload = {}, action = "enter") => {
     if (!roomId || !payload.userId) return;
     const name = payload.name || payload.userName || "User";
     const text = action === "exit" ? `${name} خرج من الغرفة` : `${name} دخل الغرفة`;
-    io.in(roomId).emit("comment", JSON.stringify({
+    const comment = await saveRoomEvent(roomId, {
       comment: text,
       liveStreamingId: roomId,
       liveHistoryId: roomId,
@@ -133,7 +148,8 @@ io.on("connection", async (socket) => {
         gender: payload.gender || "",
         isVIP: !!payload.isVIP,
       },
-    }));
+    }, action);
+    io.in(roomId).emit("comment", JSON.stringify(comment));
   };
 
   const emitLiveViewList = async (roomId, entryPayload = null) => {
@@ -283,7 +299,8 @@ io.on("connection", async (socket) => {
       const { roomId, liveHistoryId } = await resolveLiveRoom(payload);
       if (!roomId) return;
       joinLiveRoom(roomId);
-      io.in(roomId).emit("comment", JSON.stringify(normalizedPayload(payload, roomId)));
+      const comment = await saveRoomEvent(roomId, payload, "comment");
+      io.in(roomId).emit("comment", JSON.stringify(comment));
       if (liveHistoryId) {
         await LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $inc: { liveComments: 1 } });
       }
@@ -331,7 +348,8 @@ io.on("connection", async (socket) => {
         LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $set: { audienceCount: totalViews } }),
       ]);
       await emitLiveViewList(roomId, payload);
-      if (!existingView) emitRoomSystemComment(roomId, payload, "enter");
+      if (!existingView) await emitRoomSystemComment(roomId, payload, "enter");
+      await emitRoomHistory(roomId);
     } catch (error) {
       console.error("[addView] Error:", error);
     }
@@ -351,7 +369,7 @@ io.on("connection", async (socket) => {
         LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $set: { audienceCount: totalViews } }),
       ]);
       await emitLiveViewList(roomId);
-      emitRoomSystemComment(roomId, { ...payload, ...(removedView || {}) }, "exit");
+      await emitRoomSystemComment(roomId, { ...payload, ...(removedView || {}) }, "exit");
       socket.leave(roomId);
     } catch (error) {
       console.error("[lessView] Error:", error);
@@ -497,6 +515,26 @@ io.on("connection", async (socket) => {
       if (!roomId) return;
       joinLiveRoom(roomId);
       io.in(roomId).emit("gift", JSON.stringify(normalizedPayload(payload, roomId)));
+      let giftName = "هدية";
+      try {
+        const gift = typeof payload.gift === "string" ? JSON.parse(payload.gift) : payload.gift;
+        giftName = gift?.name || gift?.title || giftName;
+      } catch (_) {}
+      const giftComment = await saveRoomEvent(roomId, {
+        comment: `${payload.userName || "مستخدم"} أرسل ${giftName} إلى ${payload.receiverUserName || "مستخدم"}`,
+        isJoined: false,
+        type: "comment",
+        reaction: "",
+        giftCount: String(payload.giftCount || ""),
+        user: {
+          _id: String(payload.senderUserId || ""),
+          id: String(payload.senderUserId || ""),
+          name: payload.userName || "مستخدم",
+          image: payload.userImage || payload.image || "",
+        },
+        gift: payload.gift,
+      }, "gift");
+      io.in(roomId).emit("comment", JSON.stringify(giftComment));
       if (liveHistoryId) {
         await LiveBroadcastHistory.updateOne({ _id: liveHistoryId }, { $inc: { gifts: 1, coins: Number(payload.coin || 0) } });
       }
@@ -562,6 +600,7 @@ io.on("connection", async (socket) => {
       io.in(roomId).emit("hostJoinAudioRoom", outgoing);
       await emitLiveViewList(roomId);
       await emitSeatState(roomId);
+      await emitRoomHistory(roomId);
     } catch (error) {
       console.error("[hostJoinAudioRoom] Error:", error);
     }
@@ -575,6 +614,7 @@ io.on("connection", async (socket) => {
       joinLiveRoom(roomId);
       await emitLiveViewList(roomId);
       await emitSeatState(roomId);
+      await emitRoomHistory(roomId);
     } catch (error) {
       console.error("[liveRejoin] Error:", error);
     }
