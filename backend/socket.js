@@ -34,14 +34,11 @@ io.on("connection", async (socket) => {
 
   const { globalRoom } = socket.handshake.query;
   const id = globalRoom?.split(":")[1];
-  if (!id || !mongoose.Types.ObjectId.isValid(id)) {
-    console.warn("Invalid or missing ID from globalRoom:", globalRoom);
-    return;
-  }
-
-  console.log("Socket connected with:", id);
-
-  if (globalRoom) {
+  const hasValidMongoUserId = !!id && mongoose.Types.ObjectId.isValid(id);
+  if (!hasValidMongoUserId) {
+    console.warn("Invalid or missing ID from globalRoom; live events remain enabled:", globalRoom);
+  } else if (globalRoom) {
+    console.log("Socket connected with:", id);
     if (!socket.rooms.has(globalRoom)) {
       socket.join(globalRoom);
       console.log(`Socket joined room: ${globalRoom}`);
@@ -60,8 +57,6 @@ io.on("connection", async (socket) => {
         await Host.findByIdAndUpdate(host._id, { $set: { isOnline: true } }, { new: true });
       }
     }
-  } else {
-    console.warn("Invalid globalRoom format:", globalRoom);
   }
 
   const parseSocketPayload = (payload) => {
@@ -78,7 +73,10 @@ io.on("connection", async (socket) => {
   };
 
   const toObjectId = (value) => (value && mongoose.Types.ObjectId.isValid(String(value)) ? new mongoose.Types.ObjectId(String(value)) : null);
-  const liveRoomIdFrom = (payload = {}) => String(payload.liveHistoryId || payload.liveStreamingId || payload.liveRoom || payload.liveUserMongoId || "");
+  const cleanRoomId = (value) => String(value ?? "").trim();
+  const liveRoomIdFrom = (payload = {}) => cleanRoomId(
+    payload.liveHistoryId || payload.liveStreamingId || payload.liveRoom || payload.liveUserMongoId,
+  );
 
   const liveRoomQueryFrom = (roomId) => {
     const objectId = toObjectId(roomId);
@@ -105,10 +103,13 @@ io.on("connection", async (socket) => {
   });
 
   const joinLiveRoom = (roomId) => {
-    if (roomId && !socket.rooms.has(roomId)) {
-      socket.join(roomId);
-      console.log(`[audioRoom] socket ${socket.id} joined ${roomId}`);
+    const normalizedRoomId = cleanRoomId(roomId);
+    if (normalizedRoomId && !socket.rooms.has(normalizedRoomId)) {
+      socket.join(normalizedRoomId);
+      console.log(`[audioRoom] socket ${socket.id} joined ${normalizedRoomId}`);
     }
+    if (normalizedRoomId) socket.emit("audioRoomJoined", { roomId: normalizedRoomId, socketId: socket.id });
+    return normalizedRoomId;
   };
 
   const liveRoomEvents = () => mongoose.connection.db.collection("liveroomevents");
