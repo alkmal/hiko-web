@@ -114,9 +114,41 @@ io.on("connection", async (socket) => {
 
   const liveRoomEvents = () => mongoose.connection.db.collection("liveroomevents");
 
+  // Older mobile builds occasionally send `user` as a string (a display name or
+  // a JSON-encoded object).  The Android room comment model requires an object,
+  // so normalize it before an event is broadcast or persisted.  This also keeps
+  // room history safe to restore after reconnecting.
+  const normalizedRoomEventPayload = (payload = {}, roomId = "") => {
+    let rawUser = payload.user;
+    if (typeof rawUser === "string" && rawUser.trim().startsWith("{")) {
+      try {
+        rawUser = JSON.parse(rawUser);
+      } catch (_) {
+        // A non-JSON string is a display name and is handled below.
+      }
+    }
+    const suppliedUser = rawUser && typeof rawUser === "object" && !Array.isArray(rawUser) ? rawUser : {};
+    const userId = String(suppliedUser._id || suppliedUser.id || payload.userId || payload.senderUserId || "");
+    const userName = suppliedUser.name || suppliedUser.userName || payload.userName || payload.name
+      || (typeof rawUser === "string" ? rawUser : "User");
+
+    return {
+      ...normalizedPayload(payload, roomId),
+      user: {
+        ...suppliedUser,
+        _id: userId,
+        id: String(suppliedUser.id || userId),
+        name: userName,
+        userName: suppliedUser.userName || userName,
+        image: suppliedUser.image || payload.userImage || payload.image || "",
+        avatarFrameImage: suppliedUser.avatarFrameImage || suppliedUser.avatarFrame || payload.avatarFrameImage || payload.avatarFrame || "",
+      },
+    };
+  };
+
   const saveRoomEvent = async (roomId, payload = {}, eventType = "comment") => {
     if (!roomId) return null;
-    const event = { ...normalizedPayload(payload, roomId), roomId, eventType, createdAt: new Date() };
+    const event = { ...normalizedRoomEventPayload(payload, roomId), roomId, eventType, createdAt: new Date() };
     const result = await liveRoomEvents().insertOne(event);
     return { ...event, _id: String(result.insertedId) };
   };
