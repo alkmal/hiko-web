@@ -3077,6 +3077,11 @@ relayRoomEvent("changeTheme");
   socket.on("disconnect", async (reason) => {
     console.log(`Socket disconnected: ${id} - ${socket.id} - Reason: ${reason}`);
 
+    // Guest, Agora and external identities are allowed to use the live-room
+    // channel. They do not have a Mongo ObjectId, so they have no account
+    // presence/call record to clean up on disconnect.
+    if (!hasValidMongoUserId) return;
+
     if (globalRoom) {
       const sockets = await io.in(globalRoom).fetchSockets();
       console.log("🔄 Checking active sockets in room:", sockets.length);
