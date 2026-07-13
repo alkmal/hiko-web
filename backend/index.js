@@ -54,6 +54,7 @@ const initializeSettings = require("./util/initializeSettings");
 async function startServer() {
   console.log("🔄 Initializing settings...");
   await initializeSettings();
+  const firebaseAdmin = await require("./util/privateKey");
   console.log("✅ Settings Loaded");
 
   app.get("/.well-known/assetlinks.json", (req, res) => {
@@ -279,6 +280,41 @@ async function startServer() {
   const withCompatError = (res, error) => {
     console.error(error);
     return res.status(500).json({ status: false, message: error.message || "Internal Server Error" });
+  };
+
+  const sendFollowNotification = async (follower, following) => {
+    const token = textValue(following?.fcmToken);
+    if (!token || following?.notification?.newFollow === false) return;
+    if (!firebaseAdmin?.apps?.length) {
+      console.warn("Follow notification skipped: Firebase Admin is not configured.");
+      return;
+    }
+
+    const followerId = String(follower?._id || "");
+    const followerName = textValue(follower?.name || follower?.username) || "مستخدم";
+    const title = "متابع جديد";
+    const body = `${followerName} قام بمتابعتك`;
+    const image = absoluteUrl(follower?.image || "");
+
+    await firebaseAdmin.messaging().send({
+      token,
+      notification: { title, body },
+      data: {
+        type: "USER",
+        data: followerId,
+        userId: followerId,
+        title,
+        body,
+        image,
+      },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "01",
+          sound: "default",
+        },
+      },
+    });
   };
 
 
@@ -657,6 +693,29 @@ async function startServer() {
     }
   });
 
+  app.patch("/user/fcmToken", async (req, res) => {
+    try {
+      const userId = toObjectId(req.body?.userId);
+      const identity = textValue(req.body?.identity);
+      const fcmToken = textValue(req.body?.fcmToken);
+      if (!userId || !identity || !fcmToken) {
+        return res.status(200).json({ status: false, message: "userId, identity and fcmToken are required." });
+      }
+
+      const user = await collection("users").findOne({ _id: userId, identity });
+      if (!user) return res.status(200).json({ status: false, message: "User not found." });
+
+      const updatedAt = new Date();
+      await Promise.all([
+        collection("users").updateOne({ _id: userId }, { $set: { fcmToken, updatedAt } }),
+        collection("hosts").updateMany({ userId }, { $set: { fcmToken, updatedAt } }),
+      ]);
+      return res.status(200).json({ status: true, message: "FCM token updated." });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
   app.get("/user/profile", async (req, res) => {
     const userId = req.query.userId;
     const query = userId && mongoose.Types.ObjectId.isValid(userId) ? { _id: new mongoose.Types.ObjectId(userId) } : { uniqueId: "100001" };
@@ -730,7 +789,13 @@ async function startServer() {
       if (!followerId || !followingId) return res.status(200).json({ status: false, message: "Invalid request.", isFollow: false });
       if (String(followerId) === String(followingId)) return res.status(200).json({ status: false, message: "You cannot follow yourself.", isFollow: false });
 
-      const existing = await collection("followerfollowings").findOne({ followerId, followingId });
+      const [follower, following, existing] = await Promise.all([
+        collection("users").findOne({ _id: followerId, isBlock: { $ne: true } }),
+        collection("users").findOne({ _id: followingId, isBlock: { $ne: true } }),
+        collection("followerfollowings").findOne({ followerId, followingId }),
+      ]);
+      if (!follower || !following) return res.status(200).json({ status: false, message: "User not found.", isFollow: false });
+
       if (existing) {
         await Promise.all([
           collection("followerfollowings").deleteOne({ _id: existing._id }),
@@ -745,6 +810,9 @@ async function startServer() {
         collection("users").updateOne({ _id: followerId }, { $inc: { following: 1 }, $set: { updatedAt: new Date() } }),
         collection("users").updateOne({ _id: followingId }, { $inc: { followers: 1 }, $set: { updatedAt: new Date() } }),
       ]);
+      sendFollowNotification(follower, following).catch((error) => {
+        console.error("Follow notification failed:", error.message || error);
+      });
       return res.status(200).json({ status: true, message: "Followed successfully.", isFollow: true });
     } catch (error) {
       return withCompatError(res, error);

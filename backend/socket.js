@@ -286,6 +286,12 @@ io.on("connection", async (socket) => {
     const explicitIndex = Number(payload.seatIndex ?? -1);
     if (Number.isInteger(explicitIndex) && explicitIndex >= 0 && explicitIndex < seats.length) return explicitIndex;
 
+    const explicitPosition = Number(payload.seatPosition);
+    if (Number.isInteger(explicitPosition)) {
+      const byExplicitPosition = seats.findIndex((seat) => Number(seat.position) === explicitPosition);
+      if (byExplicitPosition >= 0) return byExplicitPosition;
+    }
+
     const raw = Number(payload.position);
     if (Number.isInteger(raw) && raw >= 0 && raw < seats.length) return raw;
     const byPosition = seats.findIndex((seat) => Number(seat.position) === raw);
@@ -417,6 +423,9 @@ io.on("connection", async (socket) => {
       joinLiveRoom(roomId);
       let accepted = false;
       let rejected = false;
+      let movedFromSeatIndex = -1;
+      let resolvedAgoraUid = Number(payload.agoraUid || payload.agoraUID || 0);
+      let resolvedMute = Number(payload.mute || 0);
       const live = await updateLiveRoomSeat(roomId, (seats) => {
         const index = seatIndexFromPayload(seats, payload);
         if (index < 0) return;
@@ -426,30 +435,45 @@ io.on("connection", async (socket) => {
           rejected = true;
           return;
         }
+        let previousSeat = null;
         if (payload.userId) {
           seats.forEach((seat, seatIndex) => {
             if (seatIndex !== index && String(seat.userId || "") === String(payload.userId)) {
+              previousSeat = { ...seat };
+              movedFromSeatIndex = seatIndex;
               seats[seatIndex] = clearSeat(seat);
             }
           });
+        }
+        if (resolvedAgoraUid <= 0 && Number(previousSeat?.agoraUid || 0) > 0) {
+          resolvedAgoraUid = Number(previousSeat.agoraUid);
+        }
+        if (payload.mute === undefined && previousSeat) {
+          resolvedMute = Number(previousSeat.mute || 0);
         }
         seats[index] = {
           ...(seats[index] || {}),
           position: seats[index]?.position || index + 1,
           reserved: true,
-          name: payload.name || "",
-          image: payload.image || "",
-          avatarFrameImage: payload.avatarFrame || payload.avatarFrameImage || "",
-          country: payload.country || "",
-          agoraUid: Number(payload.agoraUid || 0),
-          mute: Number(payload.mute || 0),
+          name: payload.name || previousSeat?.name || "",
+          image: payload.image || previousSeat?.image || "",
+          avatarFrameImage: payload.avatarFrame || payload.avatarFrameImage || previousSeat?.avatarFrameImage || "",
+          country: payload.country || previousSeat?.country || "",
+          agoraUid: resolvedAgoraUid,
+          mute: resolvedMute,
           userId: payload.userId || "",
           isSpeaking: false,
         };
         accepted = true;
       });
       if (accepted) {
-        io.in(roomId).emit("addParticipants", JSON.stringify(normalizedPayload(payload, roomId)));
+        const outgoingPayload = {
+          ...payload,
+          agoraUid: resolvedAgoraUid,
+          mute: resolvedMute,
+          ...(movedFromSeatIndex >= 0 ? { movedFromSeatIndex } : {}),
+        };
+        io.in(roomId).emit("addParticipants", JSON.stringify(normalizedPayload(outgoingPayload, roomId)));
       } else if (rejected) {
         socket.emit("seatBusy", JSON.stringify(normalizedPayload(payload, roomId)));
       }
