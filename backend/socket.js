@@ -154,9 +154,8 @@ io.on("connection", async (socket) => {
   };
 
   const emitRoomHistory = async (roomId) => {
-    if (!roomId) return;
-    const events = await liveRoomEvents().find({ roomId: String(roomId) }).sort({ createdAt: -1 }).limit(100).toArray();
-    socket.emit("roomHistory", JSON.stringify(events.map((event) => ({ ...event, _id: String(event._id) }))));
+    // Audio room comments are intentionally live-only for each client session.
+    // Do not replay comments created before the viewer entered or re-entered.
   };
 
   const emitRoomSystemComment = async (roomId, payload = {}, action = "enter") => {
@@ -388,7 +387,6 @@ io.on("connection", async (socket) => {
       ]);
       await emitLiveViewList(roomId, payload);
       if (!existingView) await emitRoomSystemComment(roomId, payload, "enter");
-      await emitRoomHistory(roomId);
     } catch (error) {
       console.error("[addView] Error:", error);
     }
@@ -657,7 +655,6 @@ io.on("connection", async (socket) => {
       io.in(roomId).emit("hostJoinAudioRoom", outgoing);
       await emitLiveViewList(roomId);
       await emitSeatState(roomId);
-      await emitRoomHistory(roomId);
     } catch (error) {
       console.error("[hostJoinAudioRoom] Error:", error);
     }
@@ -671,7 +668,6 @@ io.on("connection", async (socket) => {
       joinLiveRoom(roomId);
       await emitLiveViewList(roomId);
       await emitSeatState(roomId);
-      await emitRoomHistory(roomId);
     } catch (error) {
       console.error("[liveRejoin] Error:", error);
     }
