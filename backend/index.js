@@ -131,6 +131,9 @@ async function startServer() {
     { name: "video", maxCount: 1 },
     { name: "screenshot", maxCount: 1 },
     { name: "thumbnail", maxCount: 1 },
+    { name: "thumb", maxCount: 1 },
+    { name: "preview", maxCount: 1 },
+    { name: "audio", maxCount: 1 },
   ]);
 
   const collection = (name) => mongoose.connection.db.collection(name);
@@ -456,6 +459,78 @@ async function startServer() {
     song: video.song || null,
     createdAt: video.createdAt || new Date(),
   });
+
+  const chatMessageTypeForClient = (type) => {
+    const numeric = Number(type);
+    if (numeric === 2) return "image";
+    if (numeric === 3) return "audio";
+    if (numeric === 4) return "chatGift";
+    if (numeric === 5) return "Audio call";
+    if (numeric === 6) return "Video call";
+    return "message";
+  };
+
+  const chatMessageLabel = (chat = {}) => {
+    const type = Number(chat.messageType || 1);
+    if (type === 2) return "Image";
+    if (type === 3) return "Voice message";
+    return textValue(chat.message) || "Message";
+  };
+
+  const formatChatForClient = (chat = {}) => ({
+    ...chat,
+    _id: String(chat._id || ""),
+    id: String(chat._id || ""),
+    senderId: String(chat.senderId || ""),
+    topic: String(chat.chatTopicId || chat.topic || ""),
+    chatTopicId: String(chat.chatTopicId || chat.topic || ""),
+    messageType: chatMessageTypeForClient(chat.messageType),
+    message: chat.message || chatMessageLabel(chat),
+    image: chat.image || "",
+    audio: chat.audio || "",
+    date: chat.date || "",
+    createdAt: chat.createdAt || new Date(),
+  });
+
+  const sendChatNotification = async (senderId, receiverId, chat = {}) => {
+    const senderObjectId = toObjectId(senderId);
+    const receiverObjectId = toObjectId(receiverId);
+    if (!senderObjectId || !receiverObjectId || String(senderObjectId) === String(receiverObjectId)) return;
+
+    const [sender, receiver] = await Promise.all([
+      collection("users").findOne({ _id: senderObjectId }),
+      collection("users").findOne({ _id: receiverObjectId }),
+    ]);
+
+    const token = textValue(receiver?.fcmToken);
+    if (!sender || !receiver || !token || receiver?.notification?.message === false) return;
+    if (!firebaseAdmin?.apps?.length) return;
+
+    const title = `${sender.name || sender.username || "User"} sent you a message`;
+    const body = chatMessageLabel(chat);
+    await firebaseAdmin.messaging().send({
+      token,
+      notification: { title, body },
+      data: {
+        type: "CHAT",
+        senderId: String(sender._id),
+        receiverId: String(receiver._id),
+        userName: String(sender.name || ""),
+        hostName: String(receiver.name || ""),
+        userImage: String(sender.image || ""),
+        hostImage: String(receiver.image || ""),
+        title,
+        body,
+      },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "01",
+          sound: "default",
+        },
+      },
+    });
+  };
 
   const isPlayableVideoPath = (value = "") => {
     const path = String(value || "").trim();
@@ -861,6 +936,164 @@ async function startServer() {
     }
   });
 
+  app.get("/chatTopic/chatList", async (req, res) => {
+    try {
+      const userId = toObjectId(req.query.userId);
+      if (!userId) return res.status(200).json({ status: false, message: "userId is required.", chatList: [] });
+
+      const start = Math.max(Number(req.query.start) || 0, 0);
+      const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
+      const topics = await collection("chattopics")
+        .find({ chatId: { $ne: null }, $or: [{ senderId: userId }, { receiverId: userId }] })
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .skip(start)
+        .limit(limit)
+        .toArray();
+
+      const otherIds = topics.map((topic) => String(topic.senderId) === String(userId) ? topic.receiverId : topic.senderId).filter(Boolean);
+      const [people, chats, unreadRows] = await Promise.all([
+        collection("users").find({ _id: { $in: otherIds } }).toArray(),
+        collection("chats").find({ _id: { $in: topics.map((topic) => topic.chatId).filter(Boolean) } }).toArray(),
+        collection("chats").aggregate([
+          { $match: { chatTopicId: { $in: topics.map((topic) => topic._id) }, senderId: { $ne: userId }, isRead: false } },
+          { $group: { _id: "$chatTopicId", unreadCount: { $sum: 1 } } },
+        ]).toArray(),
+      ]);
+
+      const peopleById = new Map(people.map((person) => [String(person._id), cleanGuestUser(person)]));
+      const chatsById = new Map(chats.map((chat) => [String(chat._id), chat]));
+      const unreadByTopic = new Map(unreadRows.map((row) => [String(row._id), row.unreadCount || 0]));
+
+      const chatList = topics.map((topic) => {
+        const otherId = String(topic.senderId) === String(userId) ? topic.receiverId : topic.senderId;
+        const person = peopleById.get(String(otherId)) || {};
+        const chat = chatsById.get(String(topic.chatId)) || {};
+        return {
+          _id: String(topic._id),
+          userId: String(otherId || ""),
+          topic: String(topic._id),
+          name: person.name || "",
+          username: person.username || "",
+          image: person.image || "",
+          avatarFrameImage: person.avatarFrameImage || "",
+          country: person.country || "",
+          countryFlagImage: person.countryFlagImage || "",
+          isVIP: !!person.isVIP,
+          isFake: !!person.isFake,
+          isOnline: !!person.isOnline,
+          message: chatMessageLabel(chat),
+          messageType: chatMessageTypeForClient(chat.messageType),
+          unreadCount: unreadByTopic.get(String(topic._id)) || 0,
+          chatDate: chat.date || "",
+          time: chat.time || "Just Now",
+        };
+      });
+
+      return res.status(200).json({ status: true, message: "Success", chatList });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
+  app.delete("/chatTopic/deleteAllChatsAndTopics", async (req, res) => {
+    try {
+      const userId = toObjectId(req.query.userId);
+      if (!userId) return res.status(200).json({ status: false, message: "userId is required." });
+      const topics = await collection("chattopics").find({ $or: [{ senderId: userId }, { receiverId: userId }] }).project({ _id: 1 }).toArray();
+      const topicIds = topics.map((topic) => topic._id);
+      await Promise.all([
+        collection("chats").deleteMany({ chatTopicId: { $in: topicIds } }),
+        collection("chattopics").deleteMany({ _id: { $in: topicIds } }),
+      ]);
+      return res.status(200).json({ status: true, message: "Chats deleted." });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
+  app.get("/chat/getOldChat", async (req, res) => {
+    try {
+      const topicId = toObjectId(req.query.topicId || req.query.chatTopicId);
+      const userId = toObjectId(req.query.userId);
+      if (!topicId) return res.status(200).json({ status: false, message: "topicId is required.", chat: [] });
+
+      const start = Math.max(Number(req.query.start) || 0, 0);
+      const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
+      if (userId) {
+        await collection("chats").updateMany({ chatTopicId: topicId, senderId: { $ne: userId }, isRead: false }, { $set: { isRead: true } });
+      }
+
+      const chat = (await collection("chats")
+        .find({ chatTopicId: topicId })
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(start)
+        .limit(limit)
+        .toArray()).map(formatChatForClient);
+
+      return res.status(200).json({ status: true, message: "Chat history retrieved successfully.", chatTopic: String(topicId), chat });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
+  app.post("/chat/uploadImage", compatUpload, async (req, res) => {
+    try {
+      const senderId = toObjectId(req.body?.senderId);
+      const topicId = toObjectId(req.body?.topic || req.body?.chatTopicId);
+      const rawType = lowerValue(req.body?.messageType);
+      const isAudio = rawType === "3" || rawType === "audio" || rawType === "voice";
+      const messageType = isAudio ? 3 : 2;
+      const uploadFile = firstUploadedFile(req, isAudio ? "audio" : "image");
+      const mediaPath = filePath(uploadFile);
+      if (!senderId || !topicId || !mediaPath) {
+        return res.status(200).json({ status: false, message: "Missing chat media data.", chat: null });
+      }
+
+      const chatTopic = await collection("chattopics").findOne({ _id: topicId });
+      if (!chatTopic) return res.status(200).json({ status: false, message: "Chat topic not found.", chat: null });
+
+      const receiverId = String(chatTopic.senderId) === String(senderId) ? chatTopic.receiverId : chatTopic.senderId;
+      const now = new Date();
+      const chat = {
+        _id: new mongoose.Types.ObjectId(),
+        chatTopicId: topicId,
+        senderId,
+        messageType,
+        message: isAudio ? "Voice message" : "Image",
+        image: isAudio ? "" : mediaPath,
+        audio: isAudio ? mediaPath : "",
+        isRead: false,
+        date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await Promise.all([
+        collection("chats").insertOne(chat),
+        collection("chattopics").updateOne({ _id: topicId }, { $set: { chatId: chat._id, updatedAt: now }, $inc: { messageCount: 1 } }),
+      ]);
+
+      sendChatNotification(senderId, receiverId, chat).catch((error) => {
+        console.error("Chat media notification failed:", error.message || error);
+      });
+
+      return res.status(200).json({ status: true, message: "Message sent successfully.", chat: formatChatForClient(chat) });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
+  app.delete("/chat/deleteMessage", async (req, res) => {
+    try {
+      const chatId = toObjectId(req.query.chatId);
+      if (!chatId) return res.status(200).json({ status: false, message: "chatId is required." });
+      const result = await collection("chats").deleteOne({ _id: chatId });
+      return res.status(200).json({ status: result.deletedCount > 0, message: result.deletedCount > 0 ? "Message deleted." : "Message not found." });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
   const cleanFakeUser = (host) => host ? {
     ...host,
     _id: String(host._id),
@@ -1174,8 +1407,8 @@ async function startServer() {
       const userId = toObjectId(req.body?.userId);
       const videoPath = filePath(firstUploadedFile(req, "video"));
       const screenshotPath = filePath(firstUploadedFile(req, "screenshot"));
-      const thumbnailPath = filePath(firstUploadedFile(req, "thumbnail")) || screenshotPath;
-      if (!userId || !videoPath) return res.status(200).json({ status: false, message: "Missing video data." });
+      const thumbnailPath = filePath(firstUploadedFile(req, "thumbnail") || firstUploadedFile(req, "thumb") || firstUploadedFile(req, "preview")) || screenshotPath;
+      if (!userId || !videoPath) return res.status(200).json({ status: false, message: "Missing video file or userId." });
 
       const user = await collection("users").findOne({ _id: userId });
       const video = {

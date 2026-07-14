@@ -79,11 +79,11 @@ exports.pushChatMessage = async (req, res) => {
     if (messageType == 2) {
       chat.messageType = 2;
       chat.message = "📸 Image";
-      chat.image = req?.files?.image ? req?.files?.image[0].path : "";
+      chat.image = req?.files?.image?.[0]?.path || "";
     } else if (messageType == 3) {
       chat.messageType = 3;
       chat.message = "🎤 Audio";
-      chat.audio = req?.files?.audio ? req?.files?.audio[0].path : "";
+      chat.audio = req?.files?.audio?.[0]?.path || "";
     } else {
       if (req.files) deleteFiles(req.files);
       return res.status(200).json({ status: false, message: "messageType must be passed valid." });
@@ -177,6 +177,17 @@ exports.pushChatMessage = async (req, res) => {
           isOnline: String(receiver?.isOnline ?? ""),
           senderRole: "user",
           isFakeSender: "false",
+        },
+        notification: {
+          title: `${sender.name} sent you a message`,
+          body: `${chat.message}`,
+        },
+        android: {
+          priority: "high",
+          notification: {
+            channelId: "01",
+            sound: "default",
+          },
         },
       };
 
@@ -302,11 +313,11 @@ exports.submitChatMessage = async (req, res) => {
     if (messageType == 2) {
       chat.messageType = 2;
       chat.message = "📸 Image";
-      chat.image = req.files ? req?.files?.image[0].path : "";
+      chat.image = req?.files?.image?.[0]?.path || "";
     } else if (messageType == 3) {
       chat.messageType = 3;
       chat.message = "🎤 Audio";
-      chat.audio = req.files ? req?.files?.audio[0].path : "";
+      chat.audio = req?.files?.audio?.[0]?.path || "";
     } else {
       if (req.files) deleteFiles(req.files);
       return res.status(200).json({ status: false, message: "messageType must be passed valid." });
@@ -347,6 +358,17 @@ exports.submitChatMessage = async (req, res) => {
           isOnline: String(receiver?.isOnline ?? ""),
           senderRole: "user",
           isFakeSender: "false",
+        },
+        notification: {
+          title: `${sender.name} sent you a message`,
+          body: `${chat.message}`,
+        },
+        android: {
+          priority: "high",
+          notification: {
+            channelId: "01",
+            sound: "default",
+          },
         },
       };
 

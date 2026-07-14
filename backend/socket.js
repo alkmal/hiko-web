@@ -681,6 +681,83 @@ relayRoomEvent("changeTheme");
   relayRoomEvent("updateBlockedList", "blockedListUpdated");
   relayRoomEvent("blockedList");
 
+  const normalizeSocketGuestUser = (user = {}, isFollow = false) => ({
+    ...user,
+    _id: String(user._id || ""),
+    id: String(user._id || ""),
+    userId: String(user._id || ""),
+    name: user.name || "User",
+    username: user.username || "",
+    uniqueId: user.uniqueId || "",
+    image: user.image || "",
+    coverImage: user.coverImage || "",
+    avatarFrameImage: user.avatarFrameImage || "",
+    country: user.country || "",
+    countryFlagImage: user.countryFlagImage || "",
+    gender: user.gender || "",
+    age: Number(user.age) || 0,
+    bio: user.bio || "",
+    followers: Number(user.followers) || 0,
+    following: Number(user.following) || 0,
+    post: Number(user.post) || 0,
+    video: Number(user.video) || 0,
+    isFollow: !!isFollow,
+    isFake: !!user.isFake,
+    isVIP: !!(user.isVIP || user.isVip),
+    isHost: !!user.isHost,
+    isAgency: !!user.isAgency,
+    isCoinSeller: !!user.isCoinSeller,
+    level: user.level || null,
+  });
+
+  const emitSocketUserProfile = async (data, responseEvent) => {
+    try {
+      const payload = parseSocketPayload(data);
+      const targetId = toObjectId(payload.toUserId || payload.userId);
+      const fromUserId = toObjectId(payload.fromUserId);
+      if (!targetId) {
+        socket.emit(responseEvent, JSON.stringify({ userId: "" }));
+        return;
+      }
+
+      let user = await User.findOne({ _id: targetId, isBlock: { $ne: true } }).lean();
+      if (!user) {
+        const host = await Host.findOne({
+          $or: [{ _id: targetId }, { userId: targetId }],
+          isBlock: { $ne: true },
+        }).lean();
+        if (host?.userId) {
+          user = await User.findOne({ _id: host.userId, isBlock: { $ne: true } }).lean();
+        }
+        if (!user && host) {
+          user = { ...host, _id: host.userId || host._id, isHost: true };
+        }
+      }
+
+      if (!user) {
+        socket.emit(responseEvent, JSON.stringify({ userId: "" }));
+        return;
+      }
+
+      let isFollow = false;
+      if (fromUserId && String(fromUserId) !== String(user._id)) {
+        const follow = await mongoose.connection.db.collection("followerfollowings").findOne({
+          followerId: fromUserId,
+          followingId: toObjectId(user._id),
+        });
+        isFollow = !!follow;
+      }
+
+      socket.emit(responseEvent, JSON.stringify(normalizeSocketGuestUser(user, isFollow)));
+    } catch (error) {
+      console.error(`[${responseEvent}] Error:`, error);
+      socket.emit(responseEvent, JSON.stringify({ userId: "" }));
+    }
+  };
+
+  socket.on("getUserProfile", (data) => emitSocketUserProfile(data, "getUserProfile"));
+  socket.on("getUserProfile2", (data) => emitSocketUserProfile(data, "getUserProfile2"));
+
   const chatActorProjection = "_id name image fcmToken isBlock coin chatRate agencyId isVip isVIP isFake";
 
   const normalizeChatPayload = (data) => {
@@ -690,8 +767,10 @@ relayRoomEvent("changeTheme");
     if (!normalized.topic && normalized.chatTopicId) normalized.topic = String(normalized.chatTopicId);
 
     const rawType = String(normalized.messageType ?? "").toLowerCase();
-    normalized.dbMessageType = rawType === "2" || rawType === "image" ? 2 : 1;
-    normalized.clientMessageType = normalized.dbMessageType === 2 ? "image" : "message";
+    normalized.dbMessageType = rawType === "2" || rawType === "image" ? 2
+      : rawType === "3" || rawType === "audio" || rawType === "voice" ? 3
+        : 1;
+    normalized.clientMessageType = normalized.dbMessageType === 2 ? "image" : normalized.dbMessageType === 3 ? "audio" : "message";
 
     return normalized;
   };
@@ -956,6 +1035,17 @@ relayRoomEvent("changeTheme");
               isOnline: String(parseData?.isOnline ?? ""),
               isFakeSender: String(parseData?.senderRole === "host" ? !!sender?.isFake : false),
             },
+            notification: {
+              title: `${sender?.name} sent you a message`,
+              body: `${chat?.message}`,
+            },
+            android: {
+              priority: "high",
+              notification: {
+                channelId: "01",
+                sound: "default",
+              },
+            },
           };
 
           try {
@@ -981,6 +1071,7 @@ relayRoomEvent("changeTheme");
         chatTopicId: String(chatTopic._id),
         message: parseData.message || "",
         image: parseData.image || "",
+        audio: parseData.audio || "",
         date: parseData.date || new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
       };
 
@@ -1211,9 +1302,9 @@ relayRoomEvent("changeTheme");
   socket.on("chatGiftSent", handleChatGiftSent);
   socket.on("chatOrCallGiftSent", handleChatGiftSent);
 
-  socket.on("chatMessageSeen", async (data) => {
+  const handleChatMessageSeen = async (data) => {
     try {
-      const parsedData = JSON.parse(data);
+      const parsedData = parseSocketPayload(data);
       console.log("🔹 Data in chatMessageSeen event:", parsedData);
 
       const updated = await Chat.findByIdAndUpdate(parsedData.messageId, { $set: { isRead: true } }, { new: true, lean: true, select: "_id isRead" });
@@ -1226,7 +1317,10 @@ relayRoomEvent("changeTheme");
     } catch (error) {
       console.error("Error updating chatMessageSeen:", error);
     }
-  });
+  };
+
+  socket.on("chatMessageSeen", handleChatMessageSeen);
+  socket.on("messageReadStatus", handleChatMessageSeen);
 
   //private video call
   socket.on("callRinging", async (data) => {
