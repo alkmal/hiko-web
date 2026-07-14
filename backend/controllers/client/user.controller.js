@@ -209,6 +209,8 @@ exports.signInOrSignUpUser = async (req, res) => {
         },
       });
 
+      setImmediate(async () => {
+        try {
       const uniqueId = await generateHistoryUniqueId();
 
       await Promise.all([
@@ -338,6 +340,11 @@ exports.signInOrSignUpUser = async (req, res) => {
           adminInstance.messaging().send(payload).catch(console.error);
         }
       }
+        } catch (error) {
+          console.error("Post signup task failed:", error.message || error);
+        }
+      });
+      return;
     }
   } catch (error) {
     if (error.code === 11000 && error?.keyPattern?.firebaseUid) {

@@ -10,6 +10,27 @@ if (!privateKey) {
 //import model
 const User = require("../models/user.model");
 
+const tokenCache = new Map();
+const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
+const TOKEN_CACHE_MAX_SIZE = 5000;
+
+const verifyFirebaseToken = async (token) => {
+  const now = Date.now();
+  const cached = tokenCache.get(token);
+  if (cached && cached.expiresAt > now) return cached.decodedToken;
+
+  const decodedToken = await admin.auth().verifyIdToken(token);
+  const tokenExpiryMs = decodedToken.exp ? decodedToken.exp * 1000 - 30000 : now + TOKEN_CACHE_TTL_MS;
+  const expiresAt = Math.min(now + TOKEN_CACHE_TTL_MS, tokenExpiryMs);
+
+  if (expiresAt > now) {
+    if (tokenCache.size >= TOKEN_CACHE_MAX_SIZE) tokenCache.clear();
+    tokenCache.set(token, { decodedToken, expiresAt });
+  }
+
+  return decodedToken;
+};
+
 const validateUserAccessToken = async (req, res, next) => {
   const authHeader = req.headers["authorization"] || req.headers["Authorization"];
   const userUid = req.headers["x-user-uid"];
@@ -27,7 +48,7 @@ const validateUserAccessToken = async (req, res, next) => {
   const token = authHeader.split("Bearer ")[1];
 
   try {
-    const [decodedToken, mongoUser] = await Promise.all([admin.auth().verifyIdToken(token), User.findOne({ firebaseUid: userUid }).select("_id isBlock").lean()]);
+    const [decodedToken, mongoUser] = await Promise.all([verifyFirebaseToken(token), User.findOne({ firebaseUid: userUid }).select("_id isBlock").lean()]);
 
     if (!decodedToken) {
       console.warn("⚠️ [AUTH] Token verification failed.");

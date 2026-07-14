@@ -1,15 +1,30 @@
 const User = require("../../models/user.model");
 const History = require("../../models/history.model");
+const FollowerFollowing = require("../../models/followerFollowing.model");
 
 const mongoose = require("mongoose");
 
 const generateHistoryUniqueId = require("../../util/generateHistoryUniqueId");
 
+const parsePageNumber = (value, fallback = 1) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const parseLimit = (value, fallback = 20, max = 100) => {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, max);
+};
+
+const escapeRegex = (value = "") => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 //get users
 exports.retrieveUserList = async (req, res) => {
   try {
-    const start = req.query.start ? parseInt(req.query.start) : 1;
-    const limit = req.query.limit ? parseInt(req.query.limit) : 20;
+    const start = parsePageNumber(req.query.start, 1);
+    const limit = parseLimit(req.query.limit, 20, 100);
+    const skip = (start - 1) * limit;
 
     const searchString = req.query.search || "";
     const startDate = req.query.startDate || "All";
@@ -39,8 +54,9 @@ exports.retrieveUserList = async (req, res) => {
 
     let searchQuery = {};
     if (searchString !== "All" && searchString !== "") {
+      const safeSearch = escapeRegex(searchString.trim());
       searchQuery = {
-        $or: [{ name: { $regex: searchString, $options: "i" } }, { email: { $regex: searchString, $options: "i" } }, { uniqueId: { $regex: searchString, $options: "i" } }],
+        $or: [{ name: { $regex: safeSearch, $options: "i" } }, { email: { $regex: safeSearch, $options: "i" } }, { uniqueId: { $regex: safeSearch, $options: "i" } }],
       };
     }
 
@@ -74,69 +90,30 @@ exports.retrieveUserList = async (req, res) => {
     }
 
     if (countryFilter) {
-      filter.country = { $regex: `^${countryFilter}$`, $options: "i" };
+      filter.country = countryFilter;
     }
 
-    const result = await User.aggregate([
-      {
-        $facet: {
-          // totalActiveUsers: [{ $match: { isBlock: false, ...dateFilterQuery } }, { $count: "count" }],
-          // totalVIPUsers: [{ $match: { isVip: true, ...dateFilterQuery } }, { $count: "count" }],
-          // totalMaleUsers: [{ $match: { gender: "male", ...dateFilterQuery } }, { $count: "count" }],
-          // totalFemaleUsers: [{ $match: { gender: "female", ...dateFilterQuery } }, { $count: "count" }],
-          totalUsers: [{ $match: filter }, { $count: "count" }],
-          users: [
-            { $match: filter },
-            { $sort: { createdAt: -1 } },
-            { $skip: (start - 1) * limit },
-            { $limit: limit },
-            {
-              $lookup: {
-                from: "followerfollowings",
-                localField: "_id",
-                foreignField: "followerId",
-                pipeline: [{ $count: "count" }],
-                as: "followings",
-              },
-            },
-            {
-              $project: {
-                _id: 1,
-                uniqueId: 1,
-                name: 1,
-                email: 1,
-                image: 1,
-                countryFlagImage: 1,
-                country: 1,
-                gender: 1,
-                coin: 1,
-                rechargedCoins: 1,
-                isHost: 1,
-                isVip: 1,
-                isBlock: 1,
-                isOnline: 1,
-                loginType: 1,
-                createdAt: 1,
-                lastlogin: 1,
-                totalFollowings: { $ifNull: [{ $arrayElemAt: ["$followings.count", 0] }, 0] },
-              },
-            },
-          ],
-        },
-      },
+    const projection = "_id uniqueId name email image countryFlagImage country gender coin rechargedCoins isHost isVip isBlock isOnline loginType createdAt lastlogin";
+    const [total, users] = await Promise.all([
+      User.countDocuments(filter),
+      User.find(filter).select(projection).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
     ]);
 
-    const data = result[0];
+    const userIds = users.map((user) => user._id);
+    const followingCounts = userIds.length
+      ? await FollowerFollowing.aggregate([
+          { $match: { followerId: { $in: userIds } } },
+          { $group: { _id: "$followerId", count: { $sum: 1 } } },
+        ])
+      : [];
+    const followingCountMap = new Map(followingCounts.map((item) => [String(item._id), item.count]));
+    const data = users.map((user) => ({ ...user, totalFollowings: followingCountMap.get(String(user._id)) || 0 }));
 
     return res.status(200).json({
       status: true,
       message: "Retrieved real users!",
-      // totalActiveUsers: data.totalActiveUsers[0]?.count || 0,
-      // totalVIPUsers: data.totalVIPUsers[0]?.count || 0,
-      // totalMaleUsers: data.totalMaleUsers[0]?.count || 0,
-      // totalFemaleUsers: data.totalFemaleUsers[0]?.count || 0,
-      total: data.totalUsers[0]?.count || 0,
-      data: data.users,
+      total,
+      data,
     });
   } catch (error) {
     console.error(error);

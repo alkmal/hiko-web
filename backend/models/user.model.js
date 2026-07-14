@@ -61,7 +61,13 @@ const userSchema = new mongoose.Schema(
 );
 
 userSchema.index({ identity: 1, loginType: 1 });
+userSchema.index({ usernameLower: 1 });
+userSchema.index({ emailLower: 1 });
+userSchema.index({ email: 1 });
 userSchema.index({ isBlock: 1 });
 userSchema.index({ createdAt: -1 });
+userSchema.index({ isOnline: 1, createdAt: -1 });
+userSchema.index({ isHost: 1, createdAt: -1 });
+userSchema.index({ isVip: 1, createdAt: -1 });
 
 module.exports = mongoose.model("User", userSchema);

@@ -6,6 +6,27 @@ const privateKey = settingJSON?.privateKey;
 const Admin = require("../models/admin.model");
 const Subadmin = require("../models/subAdmin.model");
 
+const tokenCache = new Map();
+const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
+const TOKEN_CACHE_MAX_SIZE = 5000;
+
+const verifyFirebaseToken = async (token) => {
+  const now = Date.now();
+  const cached = tokenCache.get(token);
+  if (cached && cached.expiresAt > now) return cached.decodedToken;
+
+  const decodedToken = await admin.auth().verifyIdToken(token);
+  const tokenExpiryMs = decodedToken.exp ? decodedToken.exp * 1000 - 30000 : now + TOKEN_CACHE_TTL_MS;
+  const expiresAt = Math.min(now + TOKEN_CACHE_TTL_MS, tokenExpiryMs);
+
+  if (expiresAt > now) {
+    if (tokenCache.size >= TOKEN_CACHE_MAX_SIZE) tokenCache.clear();
+    tokenCache.set(token, { decodedToken, expiresAt });
+  }
+
+  return decodedToken;
+};
+
 const validateAdminFirebaseToken = async (req, res, next) => {
   if (process.env.DEMO_AUTH_BYPASS === "true" || !privateKey || Object.keys(privateKey).length === 0) {
     const adminUser = await Admin.findOne().select("_id email");
@@ -30,7 +51,7 @@ const validateAdminFirebaseToken = async (req, res, next) => {
 
   try {
     const [decodedToken, adminUser, subadminUser] = await Promise.all([
-      admin.auth().verifyIdToken(token),
+      verifyFirebaseToken(token),
       Admin.findOne({ uid: adminUid }).select("_id email"),
       Subadmin.findOne({ authId: adminUid }).select("_id email").populate("role", "name permissions"),
     ]);

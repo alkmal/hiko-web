@@ -138,6 +138,36 @@ async function startServer() {
 
   const collection = (name) => mongoose.connection.db.collection(name);
   const toObjectId = (id) => (id && mongoose.Types.ObjectId.isValid(String(id)) ? new mongoose.Types.ObjectId(String(id)) : null);
+
+  const ensurePerformanceIndexes = () => {
+    if (!mongoose.connection.db) return;
+
+    const indexJobs = [
+      collection("users").createIndex({ usernameLower: 1 }, { name: "idx_users_usernameLower", background: true }),
+      collection("users").createIndex({ emailLower: 1 }, { name: "idx_users_emailLower", background: true }),
+      collection("users").createIndex({ email: 1 }, { name: "idx_users_email", background: true }),
+      collection("users").createIndex({ createdAt: -1 }, { name: "idx_users_createdAt_desc", background: true }),
+      collection("users").createIndex({ isOnline: 1, createdAt: -1 }, { name: "idx_users_isOnline_createdAt", background: true }),
+      collection("users").createIndex({ isHost: 1, createdAt: -1 }, { name: "idx_users_isHost_createdAt", background: true }),
+      collection("users").createIndex({ isVip: 1, createdAt: -1 }, { name: "idx_users_isVip_createdAt", background: true }),
+      collection("followerfollowings").createIndex({ followerId: 1 }, { name: "idx_followerfollowings_followerId", background: true }),
+      collection("chattopics").createIndex({ senderId: 1, receiverId: 1, updatedAt: -1 }, { name: "idx_chattopics_sender_receiver_updatedAt", background: true }),
+      collection("chats").createIndex({ chatTopicId: 1, createdAt: -1 }, { name: "idx_chats_topic_createdAt", background: true }),
+    ];
+
+    Promise.allSettled(indexJobs).then((results) => {
+      const failed = results.filter((result) => result.status === "rejected");
+      if (failed.length) {
+        console.warn(`Performance index setup skipped ${failed.length} index(es).`, failed[0].reason?.message || failed[0].reason);
+      }
+    });
+  };
+
+  if (mongoose.connection.db) {
+    ensurePerformanceIndexes();
+  } else {
+    mongoose.connection.once("open", ensurePerformanceIndexes);
+  }
   const filePath = (file) => (file?.path ? file.path.replace(/\\/g, "/") : "");
   const publicBaseUrl = (req = null) => {
     const fromRequest = req?.get ? `${req.protocol}://${req.get("host")}` : "";
