@@ -151,6 +151,8 @@ async function startServer() {
       collection("users").createIndex({ isHost: 1, createdAt: -1 }, { name: "idx_users_isHost_createdAt", background: true }),
       collection("users").createIndex({ isVip: 1, createdAt: -1 }, { name: "idx_users_isVip_createdAt", background: true }),
       collection("followerfollowings").createIndex({ followerId: 1 }, { name: "idx_followerfollowings_followerId", background: true }),
+      collection("searchhistories").createIndex({ searchedBy: 1, updatedAt: -1 }, { name: "idx_searchhistories_user_updatedAt", background: true }),
+      collection("searchhistories").createIndex({ searchedBy: 1, searchedUser: 1 }, { name: "idx_searchhistories_user_target", background: true }),
       collection("chattopics").createIndex({ senderId: 1, receiverId: 1, updatedAt: -1 }, { name: "idx_chattopics_sender_receiver_updatedAt", background: true }),
       collection("chats").createIndex({ chatTopicId: 1, createdAt: -1 }, { name: "idx_chats_topic_createdAt", background: true }),
     ];
@@ -418,6 +420,45 @@ async function startServer() {
       avatarFrameImage: u.avatarFrameImage || "",
       FollowStatus: u.FollowStatus || null,
     };
+  };
+
+  const searchHistoryPayload = async (filter = {}, { start = 1, limit = 20 } = {}) => {
+    const safeStart = Math.max(Number(start) || 1, 1);
+    const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 50);
+    const skip = (safeStart - 1) * safeLimit;
+    const [rows, total] = await Promise.all([
+      collection("searchhistories").find(filter).sort({ updatedAt: -1, createdAt: -1 }).skip(skip).limit(safeLimit).toArray(),
+      collection("searchhistories").countDocuments(filter),
+    ]);
+    const userIds = idsFrom(rows.map((row) => row.searchedUser));
+    const users = userIds.length ? await collection("users").find({ _id: { $in: userIds } }).toArray() : [];
+    const userMap = new Map(users.map((user) => [String(user._id), user]));
+    const data = rows
+      .map((row) => {
+        const searchedUser = userMap.get(String(row.searchedUser));
+        if (!searchedUser) return null;
+        const numericUniqueId = Number(searchedUser.uniqueId);
+        return {
+          _id: String(row._id),
+          id: String(row._id),
+          searchedBy: String(row.searchedBy),
+          searchedUser: {
+            _id: String(searchedUser._id),
+            id: String(searchedUser._id),
+            image: absoluteUrl(searchedUser.image),
+            name: searchedUser.name || "",
+            uniqueId: Number.isFinite(numericUniqueId) ? numericUniqueId : 0,
+            username: searchedUser.username || "",
+            countryFlagImage: searchedUser.countryFlagImage || "",
+          },
+          searchText: row.searchText || "",
+          searchCount: Number(row.searchCount) || 1,
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+        };
+      })
+      .filter(Boolean);
+    return { data, total };
   };
   const followedUserIds = async (fromUserId, users = []) => {
     const followerId = toObjectId(fromUserId);
@@ -821,6 +862,70 @@ async function startServer() {
     }
   });
 
+  app.post("/searchHistory/create", async (req, res) => {
+    try {
+      const searchedBy = toObjectId(req.query.searchedBy || req.body?.searchedBy || req.body?.userId);
+      const searchedUser = toObjectId(req.query.searchedUser || req.body?.searchedUser || req.body?.searchedUserId);
+      const searchText = textValue(req.query.searchText || req.body?.searchText);
+      if (!searchedBy || !searchedUser) {
+        return res.status(200).json({ status: false, message: "searchedBy and searchedUser are required." });
+      }
+      if (String(searchedBy) === String(searchedUser)) {
+        return res.status(200).json({ status: true, message: "Self search skipped." });
+      }
+
+      const target = await collection("users").findOne({ _id: searchedUser, isBlock: { $ne: true } });
+      if (!target) return res.status(200).json({ status: false, message: "User not found." });
+
+      const now = new Date();
+      await collection("searchhistories").updateOne(
+        { searchedBy, searchedUser },
+        {
+          $set: { searchedBy, searchedUser, searchText, updatedAt: now },
+          $setOnInsert: { createdAt: now },
+          $inc: { searchCount: 1 },
+        },
+        { upsert: true }
+      );
+
+      return res.status(200).json({ status: true, message: "Search history saved." });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
+  app.get("/searchHistory/get", async (req, res) => {
+    try {
+      const userId = toObjectId(req.query.userId || req.body?.userId);
+      if (!userId) return res.status(200).json({ status: false, message: "userId is required.", data: [], total: 0 });
+
+      const { data, total } = await searchHistoryPayload(
+        { searchedBy: userId },
+        { start: req.query.start, limit: req.query.limit }
+      );
+      return res.status(200).json({ status: true, message: "Search history fetched.", data, total });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
+  app.delete("/searchHistory/delete", async (req, res) => {
+    try {
+      const userId = toObjectId(req.query.userId || req.body?.userId);
+      const historyId = toObjectId(req.query.historyId || req.body?.historyId);
+      if (!userId) return res.status(200).json({ status: false, message: "userId is required." });
+
+      const filter = historyId ? { _id: historyId, searchedBy: userId } : { searchedBy: userId };
+      const result = historyId
+        ? await collection("searchhistories").deleteOne(filter)
+        : await collection("searchhistories").deleteMany(filter);
+
+      return res.status(200).json({ status: true, message: "Search history deleted.", deleted: result.deletedCount || 0 });
+    } catch (error) {
+      return withCompatError(res, error);
+    }
+  });
+
   app.get("/user/profile", async (req, res) => {
     const userId = req.query.userId;
     const query = userId && mongoose.Types.ObjectId.isValid(userId) ? { _id: new mongoose.Types.ObjectId(userId) } : { uniqueId: "100001" };
@@ -880,8 +985,18 @@ async function startServer() {
       if (!targetId) return res.status(200).json({ status: false, message: "User not found.", user: null });
       const user = await collection("users").findOne({ _id: targetId, isBlock: { $ne: true } });
       if (!user) return res.status(200).json({ status: false, message: "User not found.", user: null });
-      const followSet = await followedUserIds(fromUserId, [user]);
-      return res.status(200).json({ status: true, message: "User fetched", user: cleanGuestUser(user, followSet.has(String(user._id))) });
+      const [followSet, liveInfo] = await Promise.all([
+        followedUserIds(fromUserId, [user]),
+        liveRoomForProfileUser(user._id),
+      ]);
+      return res.status(200).json({
+        status: true,
+        message: "User fetched",
+        user: {
+          ...cleanGuestUser(user, followSet.has(String(user._id))),
+          ...liveInfo,
+        },
+      });
     } catch (error) {
       return withCompatError(res, error);
     }
@@ -1940,6 +2055,43 @@ async function startServer() {
       updatedAt: live.updatedAt || new Date(),
       audioConfig: live.audioConfig || { isHostMute: 0 },
       isFake: !!live.isFake,
+    };
+  };
+
+  const liveRoomForProfileUser = async (profileUserId) => {
+    const userObjectId = toObjectId(profileUserId);
+    if (!userObjectId) {
+      return { isActiveLive: false, activeLiveRoom: null, activeLiveSeatPosition: -2 };
+    }
+
+    const userId = String(userObjectId);
+    const live = await collection("livebroadcasters").findOne({
+      $or: [
+        { userId: userObjectId },
+        { liveUserId: userId },
+        { "seat.userId": userId },
+      ],
+    });
+
+    if (!live) {
+      return { isActiveLive: false, activeLiveRoom: null, activeLiveSeatPosition: -2 };
+    }
+
+    const ownerId = toObjectId(live.userId || live.liveUserId) || userObjectId;
+    const [owner, host] = await Promise.all([
+      ownerId ? collection("users").findOne({ _id: ownerId }) : null,
+      ownerId ? collection("hosts").findOne({ userId: ownerId }) : null,
+    ]);
+
+    const seatIndex = Array.isArray(live.seat)
+      ? live.seat.findIndex((seat) => String(seat.userId || "") === userId)
+      : -1;
+    const seat = seatIndex >= 0 ? live.seat[seatIndex] : null;
+
+    return {
+      isActiveLive: true,
+      activeLiveSeatPosition: seat ? Number(seat.position || seatIndex + 1) : -1,
+      activeLiveRoom: normalizeLiveUser(live, owner || {}, host || {}),
     };
   };
 

@@ -305,7 +305,7 @@ io.on("connection", async (socket) => {
     avatarFrameImage: "",
     country: "",
     agoraUid: 0,
-    mute: 0,
+    mute: Number(seat?.mute || 0) === 2 ? 2 : 0,
     userId: "",
     isSpeaking: false,
   });
@@ -421,12 +421,18 @@ io.on("connection", async (socket) => {
       joinLiveRoom(roomId);
       let accepted = false;
       let rejected = false;
+      let locked = false;
       let movedFromSeatIndex = -1;
       let resolvedAgoraUid = Number(payload.agoraUid || payload.agoraUID || 0);
-      let resolvedMute = Number(payload.mute || 0);
+      let resolvedMute = Number(payload.mute ?? 0);
       const live = await updateLiveRoomSeat(roomId, (seats) => {
         const index = seatIndexFromPayload(seats, payload);
         if (index < 0) return;
+        const existingSeatMute = Number(seats[index]?.mute || 0);
+        if (seats[index]?.lock) {
+          locked = true;
+          return;
+        }
         const currentSeatUserId = String(seats[index]?.userId || "");
         const incomingUserId = String(payload.userId || "");
         if (currentSeatUserId && incomingUserId && currentSeatUserId !== incomingUserId) {
@@ -448,6 +454,9 @@ io.on("connection", async (socket) => {
         }
         if (payload.mute === undefined && previousSeat) {
           resolvedMute = Number(previousSeat.mute || 0);
+        }
+        if (existingSeatMute === 2) {
+          resolvedMute = 2;
         }
         seats[index] = {
           ...(seats[index] || {}),
@@ -474,6 +483,8 @@ io.on("connection", async (socket) => {
         io.in(roomId).emit("addParticipants", JSON.stringify(normalizedPayload(outgoingPayload, roomId)));
       } else if (rejected) {
         socket.emit("seatBusy", JSON.stringify(normalizedPayload(payload, roomId)));
+      } else if (locked) {
+        socket.emit("seatBusy", JSON.stringify(normalizedPayload({ ...payload, locked: true }, roomId)));
       }
       if (live) io.in(roomId).emit("seat", JSON.stringify(seatPayloadFromLive(live)));
     } catch (error) {

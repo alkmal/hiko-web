@@ -5,6 +5,8 @@ const FollowerFollowing = require("../../models/followerFollowing.model");
 const mongoose = require("mongoose");
 
 const generateHistoryUniqueId = require("../../util/generateHistoryUniqueId");
+const generateUniqueId = require("../../util/generateUniqueId");
+const { deleteFile } = require("../../util/deletefile");
 
 const parsePageNumber = (value, fallback = 1) => {
   const parsed = Number.parseInt(value, 10);
@@ -18,6 +20,62 @@ const parseLimit = (value, fallback = 20, max = 100) => {
 };
 
 const escapeRegex = (value = "") => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const textValue = (value) => (value === undefined || value === null ? "" : String(value).trim());
+
+const optionalBoolean = (value) => {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  return undefined;
+};
+
+const optionalNumber = (value) => {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const userProjection =
+  "name selfIntro gender bio age image email countryFlagImage country loginType uniqueId coin spentCoins rechargedCoins isOnline isBlock isVip isHost identity mobileNumber countryCode fcmToken createdAt lastlogin";
+
+const uploadedImage = (req) => req.file?.path || textValue(req.body?.image);
+
+const removeUploadedFile = (req) => {
+  if (req.file) deleteFile(req.file);
+};
+
+const deleteLocalImage = (imagePath) => {
+  if (!imagePath || /^https?:\/\//i.test(imagePath)) return;
+  deleteFile(imagePath);
+};
+
+const buildEditableUserPayload = (body = {}, req = null) => {
+  const payload = {};
+  const stringFields = ["name", "selfIntro", "gender", "bio", "email", "countryFlagImage", "country", "identity", "mobileNumber", "countryCode", "fcmToken"];
+
+  stringFields.forEach((field) => {
+    const value = textValue(body[field]);
+    if (value) payload[field] = field === "country" || field === "gender" ? value.toLowerCase() : value;
+  });
+
+  const image = req ? uploadedImage(req) : textValue(body.image);
+  if (image) payload.image = image;
+
+  ["age", "coin", "spentCoins", "rechargedCoins", "loginType"].forEach((field) => {
+    const value = optionalNumber(body[field]);
+    if (value !== undefined) payload[field] = value;
+  });
+
+  ["isVip", "isBlock", "isOnline", "isHost"].forEach((field) => {
+    const value = optionalBoolean(body[field]);
+    if (value !== undefined) payload[field] = value;
+  });
+
+  return payload;
+};
 
 //get users
 exports.retrieveUserList = async (req, res) => {
@@ -170,6 +228,135 @@ exports.fetchUserProfile = async (req, res) => {
   } catch (error) {
     console.log(error);
     return res.status(500).json({ status: false, error: error.message || "Internal Server Error" });
+  }
+};
+
+//create user from admin panel
+exports.createUser = async (req, res) => {
+  try {
+    const name = textValue(req.body?.name);
+    const email = textValue(req.body?.email);
+    const requestedUniqueId = textValue(req.body?.uniqueId);
+
+    if (!name) {
+      removeUploadedFile(req);
+      return res.status(200).json({ status: false, message: "Name is required." });
+    }
+
+    const duplicateChecks = [];
+    if (email) duplicateChecks.push({ email });
+    if (requestedUniqueId) duplicateChecks.push({ uniqueId: requestedUniqueId });
+
+    if (duplicateChecks.length) {
+      const existingUser = await User.findOne({ $or: duplicateChecks }).select("_id email uniqueId").lean();
+      if (existingUser) {
+        removeUploadedFile(req);
+        return res.status(200).json({
+          status: false,
+          message: existingUser.email === email ? "Email already exists." : "Unique ID already exists.",
+        });
+      }
+    }
+
+    const uniqueId = requestedUniqueId || (await generateUniqueId());
+    const payload = buildEditableUserPayload(req.body, req);
+
+    const user = await User.create({
+      ...payload,
+      name,
+      email,
+      uniqueId,
+      loginType: payload.loginType || 3,
+      identity: payload.identity || `admin-${uniqueId}`,
+      firebaseUid: textValue(req.body?.firebaseUid) || `admin-${uniqueId}`,
+      provider: textValue(req.body?.provider) || "admin",
+      date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+    });
+
+    const data = await User.findById(user._id).select(userProjection).lean();
+
+    return res.status(200).json({
+      status: true,
+      message: "User created successfully.",
+      data,
+      user: data,
+    });
+  } catch (error) {
+    removeUploadedFile(req);
+
+    if (error.code === 11000) {
+      return res.status(200).json({ status: false, message: "User already exists with the same unique field." });
+    }
+
+    console.error("Create User Error:", error);
+    return res.status(500).json({ status: false, message: error.message || "Failed to create user." });
+  }
+};
+
+//update user from admin panel
+exports.updateUser = async (req, res) => {
+  try {
+    const userId = req.body?.userId || req.query?.userId;
+
+    if (!userId) {
+      removeUploadedFile(req);
+      return res.status(200).json({ status: false, message: "User ID is required." });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      removeUploadedFile(req);
+      return res.status(200).json({ status: false, message: "Invalid userId." });
+    }
+
+    const user = await User.findById(userId).select(userProjection).lean();
+    if (!user) {
+      removeUploadedFile(req);
+      return res.status(200).json({ status: false, message: "User not found." });
+    }
+
+    const requestedEmail = textValue(req.body?.email);
+    const requestedUniqueId = textValue(req.body?.uniqueId);
+    const duplicateChecks = [];
+    if (requestedEmail && requestedEmail !== user.email) duplicateChecks.push({ email: requestedEmail });
+    if (requestedUniqueId && requestedUniqueId !== user.uniqueId) duplicateChecks.push({ uniqueId: requestedUniqueId });
+
+    if (duplicateChecks.length) {
+      const existingUser = await User.findOne({ _id: { $ne: userId }, $or: duplicateChecks }).select("_id email uniqueId").lean();
+      if (existingUser) {
+        removeUploadedFile(req);
+        return res.status(200).json({
+          status: false,
+          message: existingUser.email === requestedEmail ? "Email already exists." : "Unique ID already exists.",
+        });
+      }
+    }
+
+    const payload = buildEditableUserPayload(req.body, req);
+    if (requestedUniqueId) payload.uniqueId = requestedUniqueId;
+    if (textValue(req.body?.firebaseUid)) payload.firebaseUid = textValue(req.body.firebaseUid);
+    if (textValue(req.body?.provider)) payload.provider = textValue(req.body.provider);
+
+    const updatedUser = await User.findByIdAndUpdate(userId, payload, { new: true }).select(userProjection).lean();
+
+    if (req.file && user.image && user.image !== updatedUser.image) {
+      deleteLocalImage(user.image);
+    }
+
+    return res.status(200).json({
+      status: true,
+      message: "User updated successfully.",
+      data: updatedUser,
+      user: updatedUser,
+    });
+  } catch (error) {
+    removeUploadedFile(req);
+
+    if (error.code === 11000) {
+      return res.status(200).json({ status: false, message: "User already exists with the same unique field." });
+    }
+
+    console.error("Update User Error:", error);
+    return res.status(500).json({ status: false, message: error.message || "Failed to update user." });
   }
 };
 
