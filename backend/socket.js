@@ -782,6 +782,8 @@ relayRoomEvent("changeTheme");
       : rawType === "3" || rawType === "audio" || rawType === "voice" ? 3
         : 1;
     normalized.clientMessageType = normalized.dbMessageType === 2 ? "image" : normalized.dbMessageType === 3 ? "audio" : "message";
+    const rawAudioDuration = Number(normalized.audioDuration || normalized.duration || 0);
+    normalized.audioDuration = Number.isFinite(rawAudioDuration) ? Math.max(0, Math.round(rawAudioDuration)) : 0;
 
     return normalized;
   };
@@ -1085,6 +1087,7 @@ relayRoomEvent("changeTheme");
         message: parseData.message || "",
         image: parseData.image || "",
         audio: parseData.audio || "",
+        audioDuration: parseData.audioDuration || 0,
         date: parseData.date || new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
       };
 

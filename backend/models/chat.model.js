@@ -10,6 +10,7 @@ const chatSchema = mongoose.Schema(
     message: { type: String, default: "" },
     image: { type: String, default: "" },
     audio: { type: String, default: "" },
+    audioDuration: { type: Number, default: 0 },
     giftType: { type: Number, default: 0 },
     giftCount: { type: Number, default: 0 },
     giftImage: { type: String, default: "" },

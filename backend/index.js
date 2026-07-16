@@ -195,7 +195,25 @@ async function startServer() {
   };
   const firstUploadedFile = (req, field) => req.files?.[field]?.[0] || null;
   const splitCsv = (value) => textValue(value).split(",").map((item) => item.trim()).filter(Boolean);
-  const timeLabel = () => "Just Now";
+  const timeLabel = (dateValue = new Date()) => {
+    const date = dateValue instanceof Date ? dateValue : new Date(dateValue);
+    const diffSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+    if (!Number.isFinite(diffSeconds) || diffSeconds < 60) return "Just Now";
+
+    const units = [
+      ["year", 365 * 24 * 60 * 60],
+      ["month", 30 * 24 * 60 * 60],
+      ["week", 7 * 24 * 60 * 60],
+      ["day", 24 * 60 * 60],
+      ["hour", 60 * 60],
+      ["minute", 60],
+    ];
+    for (const [unit, seconds] of units) {
+      const amount = Math.floor(diffSeconds / seconds);
+      if (amount >= 1) return `${amount} ${unit}${amount === 1 ? "" : "s"} ago`;
+    }
+    return "Just Now";
+  };
   const numberValue = (value, fallback = 0) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : fallback;
@@ -494,7 +512,7 @@ async function startServer() {
     name: post.name || user?.name || "Demo User",
     userImage: absoluteUrl(post.userImage || user?.image || ""),
     avatarFrameImage: post.avatarFrameImage || user?.avatarFrameImage || "",
-    time: post.time || timeLabel(),
+    time: timeLabel(post.createdAt || post.updatedAt || new Date()),
     createdAt: post.createdAt || new Date(),
   });
 
@@ -526,7 +544,7 @@ async function startServer() {
     name: video.name || user?.name || "Demo User",
     userImage: absoluteUrl(video.userImage || user?.image || ""),
     avatarFrameImage: video.avatarFrameImage || user?.avatarFrameImage || "",
-    time: video.time || timeLabel(),
+    time: timeLabel(video.createdAt || video.updatedAt || new Date()),
     song: video.song || null,
     createdAt: video.createdAt || new Date(),
   });
@@ -559,6 +577,7 @@ async function startServer() {
     message: chat.message || chatMessageLabel(chat),
     image: chat.image || "",
     audio: chat.audio || "",
+    audioDuration: Number(chat.audioDuration || 0),
     date: chat.date || "",
     createdAt: chat.createdAt || new Date(),
   });
@@ -1192,6 +1211,8 @@ async function startServer() {
       const rawType = lowerValue(req.body?.messageType);
       const isAudio = rawType === "3" || rawType === "audio" || rawType === "voice";
       const messageType = isAudio ? 3 : 2;
+      const rawAudioDuration = Number(req.body?.audioDuration || req.body?.duration || 0);
+      const audioDuration = isAudio && Number.isFinite(rawAudioDuration) ? Math.max(0, Math.round(rawAudioDuration)) : 0;
       const uploadFile = firstUploadedFile(req, isAudio ? "audio" : "image");
       const mediaPath = filePath(uploadFile);
       if (!senderId || !topicId || !mediaPath) {
@@ -1211,6 +1232,7 @@ async function startServer() {
         message: isAudio ? "Voice message" : "Image",
         image: isAudio ? "" : mediaPath,
         audio: isAudio ? mediaPath : "",
+        audioDuration,
         isRead: false,
         date: new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
         createdAt: now,
