@@ -1042,6 +1042,8 @@ relayRoomEvent("changeTheme");
               hostName: String(receiver?.name ?? ""),
               userImage: String(sender?.image ?? ""),
               hostImage: String(receiver?.image ?? ""),
+              topic: String(parseData?.topic ?? parseData?.chatTopicId ?? ""),
+              chatTopicId: String(parseData?.chatTopicId ?? parseData?.topic ?? ""),
               senderRole: String(parseData?.senderRole ?? ""),
               isOnline: String(parseData?.isOnline ?? ""),
               isFakeSender: String(parseData?.senderRole === "host" ? !!sender?.isFake : false),

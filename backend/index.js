@@ -590,6 +590,8 @@ async function startServer() {
         hostName: String(receiver.name || ""),
         userImage: String(sender.image || ""),
         hostImage: String(receiver.image || ""),
+        topic: String(chat.chatTopicId || chat.topic || ""),
+        chatTopicId: String(chat.chatTopicId || chat.topic || ""),
         title,
         body,
       },
@@ -980,8 +982,10 @@ async function startServer() {
   app.post("/user/getUser", async (req, res) => {
     try {
       const body = req.body || {};
-      const targetId = toObjectId(body.toUserId || body.userId || req.query.userId);
-      const fromUserId = body.fromUserId || req.query.fromUserId;
+      const targetId = toObjectId(
+        body.profileUserId || body.toUserId || req.query.profileUserId || req.query.toUserId || body.userId || req.query.userId
+      );
+      const fromUserId = body.fromUserId || req.query.fromUserId || body.userId || req.query.userId;
       if (!targetId) return res.status(200).json({ status: false, message: "User not found.", user: null });
       const user = await collection("users").findOne({ _id: targetId, isBlock: { $ne: true } });
       if (!user) return res.status(200).json({ status: false, message: "User not found.", user: null });
